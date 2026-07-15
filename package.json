@@ -1,0 +1,16 @@
+{
+  "name": "binance-relay-proxy",
+  "version": "1.0.0",
+  "description": "Relays Binance Futures !ticker@arr websocket stream so it can be reached from networks that block binance.com domains directly.",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
