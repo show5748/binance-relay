@@ -17,6 +17,9 @@ const clients = new Set();
 let binanceWs = null;
 let reconnectTimer = null;
 
+let forwardedCount = 0;
+let sinceLastLog = 0;
+
 function connectBinance() {
   console.log('[binance] connecting...');
   binanceWs = new WebSocket(BINANCE_WS_URL);
@@ -27,15 +30,19 @@ function connectBinance() {
 
   binanceWs.on('message', (data) => {
     const payload = data.toString();
+    forwardedCount++;
+    sinceLastLog++;
+    let sent = 0;
     for (const client of clients) {
       if (client.readyState === WebSocket.OPEN) {
         client.send(payload);
+        sent++;
       }
     }
   });
 
   binanceWs.on('close', (code) => {
-    console.log('[binance] closed, code=', code, '- reconnecting in 2s');
+    console.log('[binance] closed, code=', code, '- reconnecting in 2s. total forwarded so far:', forwardedCount);
     scheduleReconnect();
   });
 
@@ -44,6 +51,11 @@ function connectBinance() {
     scheduleReconnect();
   });
 }
+
+setInterval(() => {
+  console.log(`[status] clients=${clients.size} binanceWsState=${binanceWs ? binanceWs.readyState : 'null'} forwardedSinceLastLog=${sinceLastLog} totalForwarded=${forwardedCount}`);
+  sinceLastLog = 0;
+}, 10000);
 
 function scheduleReconnect() {
   if (reconnectTimer) return;
@@ -58,6 +70,7 @@ connectBinance();
 wss.on('connection', (ws) => {
   clients.add(ws);
   console.log('[client] connected, total =', clients.size);
+  ws.send(JSON.stringify({ type: 'proxy_hello', message: 'connected to relay proxy' }));
   ws.on('close', () => {
     clients.delete(ws);
     console.log('[client] disconnected, total =', clients.size);
