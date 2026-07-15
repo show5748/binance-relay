@@ -1,79 +1,56 @@
-// 바이낸스 선물 웹소켓(!ticker@arr)을 받아서 연결된 모든 클라이언트에게 그대로 중계하는 프록시 서버
-// 반드시 한국 밖(예: Glitch/Render의 미국·싱가포르 리전)에 배포해야 우회 효과가 있습니다.
+// 바이낸스 웹소켓 스트림(fstream)이 이 IP에서 데이터를 안 주는 문제가 있어,
+// REST API(fapi.binance.com)를 짧은 주기로 폴링해서 웹소켓 메시지 포맷으로 흉내내어 중계하는 방식.
+// 프론트엔드(binance_surge_screener.html)는 코드 수정 없이 그대로 씁니다.
 import { WebSocketServer, WebSocket } from 'ws';
 import http from 'http';
 import https from 'https';
 
 const PORT = process.env.PORT || 3000;
-const BINANCE_WS_URL = 'wss://fstream.binance.com/ws/!ticker@arr';
+const POLL_INTERVAL_MS = 2000; // 2초마다 REST 호출 (바이낸스 weight 제한 내에서 안전한 주기)
+const TICKER_URL = 'https://fapi.binance.com/fapi/v1/ticker/24hr';
 
-// 시작 시 REST API로 바이낸스 접속 자체가 되는지 별도로 확인
-function testRestConnectivity() {
-  https.get('https://fapi.binance.com/fapi/v1/ping', (res) => {
-    let body = '';
-    res.on('data', (c) => (body += c));
-    res.on('end', () => {
-      console.log(`[rest-test] status=${res.statusCode} body=${body.slice(0, 200)}`);
-    });
-  }).on('error', (err) => {
-    console.log('[rest-test] FAILED:', err.message);
-  });
+let pollCount = 0;
+let lastError = null;
+let lastSuccessAt = null;
 
-  https.get('https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=BTCUSDT', (res) => {
-    let body = '';
-    res.on('data', (c) => (body += c));
-    res.on('end', () => {
-      console.log(`[rest-test-ticker] status=${res.statusCode} bodyLen=${body.length} sample=${body.slice(0, 150)}`);
-    });
-  }).on('error', (err) => {
-    console.log('[rest-test-ticker] FAILED:', err.message);
+function httpsGetJson(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, (res) => {
+      let body = '';
+      res.on('data', (c) => (body += c));
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          reject(new Error(`status ${res.statusCode}: ${body.slice(0, 200)}`));
+          return;
+        }
+        try {
+          resolve(JSON.parse(body));
+        } catch (e) {
+          reject(e);
+        }
+      });
+    }).on('error', reject);
   });
 }
-testRestConnectivity();
 
-// 진단용: 단일 심볼 스트림은 데이터가 오는지 별도로 테스트
-function testSingleSymbolStream() {
-  const testWs = new WebSocket('wss://fstream.binance.com/ws/btcusdt@ticker');
-  let count = 0;
-  testWs.on('open', () => console.log('[test-single] connected to btcusdt@ticker'));
-  testWs.on('message', (data) => {
-    count++;
-    if (count === 1) console.log('[test-single] FIRST MESSAGE RECEIVED:', data.toString().slice(0, 150));
-  });
-  testWs.on('close', (code) => console.log('[test-single] closed, code=', code, 'totalReceived=', count));
-  testWs.on('error', (err) => console.log('[test-single] error:', err.message));
-  setInterval(() => {
-    console.log(`[test-single-status] receivedSoFar=${count}`);
-  }, 10000);
+// REST 응답(symbol, lastPrice, priceChangePercent, quoteVolume ...)을
+// 원래 웹소켓 !ticker@arr 포맷(s, c, P, q)으로 매핑해서 프론트엔드가 그대로 쓸 수 있게 함
+function mapToWsFormat(restArr) {
+  return restArr
+    .filter((t) => t.symbol && t.symbol.endsWith('USDT'))
+    .map((t) => ({
+      s: t.symbol,
+      c: t.lastPrice,
+      P: t.priceChangePercent,
+      q: t.quoteVolume,
+    }));
 }
-testSingleSymbolStream();
 
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end(`Binance relay proxy is running. Connected clients: ${clients.size}, binance connected: ${binanceWs && binanceWs.readyState === WebSocket.OPEN}`);
-});
-
-const wss = new WebSocketServer({ server });
-const clients = new Set();
-
-let binanceWs = null;
-let reconnectTimer = null;
-
-let forwardedCount = 0;
-let sinceLastLog = 0;
-
-function connectBinance() {
-  console.log('[binance] connecting...');
-  binanceWs = new WebSocket(BINANCE_WS_URL);
-
-  binanceWs.on('open', () => {
-    console.log('[binance] connected');
-  });
-
-  binanceWs.on('message', (data) => {
-    const payload = data.toString();
-    forwardedCount++;
-    sinceLastLog++;
+async function pollLoop() {
+  try {
+    const data = await httpsGetJson(TICKER_URL);
+    const mapped = mapToWsFormat(data);
+    const payload = JSON.stringify(mapped);
     let sent = 0;
     for (const client of clients) {
       if (client.readyState === WebSocket.OPEN) {
@@ -81,38 +58,34 @@ function connectBinance() {
         sent++;
       }
     }
-  });
-
-  binanceWs.on('close', (code) => {
-    console.log('[binance] closed, code=', code, '- reconnecting in 2s. total forwarded so far:', forwardedCount);
-    scheduleReconnect();
-  });
-
-  binanceWs.on('error', (err) => {
-    console.error('[binance] error:', err.message);
-    scheduleReconnect();
-  });
+    pollCount++;
+    lastSuccessAt = new Date().toISOString();
+    lastError = null;
+  } catch (err) {
+    lastError = err.message;
+    console.error('[poll] error:', err.message);
+  } finally {
+    setTimeout(pollLoop, POLL_INTERVAL_MS);
+  }
 }
 
-setInterval(() => {
-  console.log(`[status] clients=${clients.size} binanceWsState=${binanceWs ? binanceWs.readyState : 'null'} forwardedSinceLastLog=${sinceLastLog} totalForwarded=${forwardedCount}`);
-  sinceLastLog = 0;
-}, 10000);
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end(
+    `Binance relay proxy (REST polling mode) running.\n` +
+      `Connected clients: ${clients.size}\n` +
+      `Poll count: ${pollCount}\n` +
+      `Last success: ${lastSuccessAt}\n` +
+      `Last error: ${lastError}\n`
+  );
+});
 
-function scheduleReconnect() {
-  if (reconnectTimer) return;
-  reconnectTimer = setTimeout(() => {
-    reconnectTimer = null;
-    connectBinance();
-  }, 2000);
-}
-
-connectBinance();
+const wss = new WebSocketServer({ server });
+const clients = new Set();
 
 wss.on('connection', (ws) => {
   clients.add(ws);
   console.log('[client] connected, total =', clients.size);
-  ws.send(JSON.stringify({ type: 'proxy_hello', message: 'connected to relay proxy' }));
   ws.on('close', () => {
     clients.delete(ws);
     console.log('[client] disconnected, total =', clients.size);
@@ -120,6 +93,12 @@ wss.on('connection', (ws) => {
   ws.on('error', () => clients.delete(ws));
 });
 
+setInterval(() => {
+  console.log(`[status] clients=${clients.size} pollCount=${pollCount} lastSuccessAt=${lastSuccessAt} lastError=${lastError}`);
+}, 10000);
+
 server.listen(PORT, () => {
-  console.log('Proxy listening on port', PORT);
+  console.log('Proxy (REST polling mode) listening on port', PORT);
 });
+
+pollLoop();
