@@ -6,7 +6,7 @@ import http from 'http';
 import https from 'https';
 
 const PORT = process.env.PORT || 3000;
-const POLL_INTERVAL_MS = 2000; // 2초마다 REST 호출 (바이낸스 weight 제한 내에서 안전한 주기)
+const POLL_INTERVAL_MS = 10000; // 10초마다 REST 호출 (weight 40 * 6회/분 = 240/분, 한도 2400/분 대비 여유있게)
 const TICKER_URL = 'https://fapi.binance.com/fapi/v1/ticker/24hr';
 
 let pollCount = 0;
@@ -20,7 +20,10 @@ function httpsGetJson(url) {
       res.on('data', (c) => (body += c));
       res.on('end', () => {
         if (res.statusCode !== 200) {
-          reject(new Error(`status ${res.statusCode}: ${body.slice(0, 200)}`));
+          const err = new Error(`status ${res.statusCode}: ${body.slice(0, 300)}`);
+          err.statusCode = res.statusCode;
+          err.body = body;
+          reject(err);
           return;
         }
         try {
@@ -31,6 +34,12 @@ function httpsGetJson(url) {
       });
     }).on('error', reject);
   });
+}
+
+// 429/418 응답 바디에서 "banned until 1234567890123" 형태의 타임스탬프를 파싱
+function parseBannedUntil(body) {
+  const m = body && body.match(/banned until (\d+)/);
+  return m ? parseInt(m[1], 10) : null;
 }
 
 // REST 응답(symbol, lastPrice, priceChangePercent, quoteVolume ...)을
@@ -47,16 +56,13 @@ function mapToWsFormat(restArr) {
 }
 
 async function pollLoop() {
+  let nextDelay = POLL_INTERVAL_MS;
   try {
     const data = await httpsGetJson(TICKER_URL);
     const mapped = mapToWsFormat(data);
     const payload = JSON.stringify(mapped);
-    let sent = 0;
     for (const client of clients) {
-      if (client.readyState === WebSocket.OPEN) {
-        client.send(payload);
-        sent++;
-      }
+      if (client.readyState === WebSocket.OPEN) client.send(payload);
     }
     pollCount++;
     lastSuccessAt = new Date().toISOString();
@@ -64,9 +70,19 @@ async function pollLoop() {
   } catch (err) {
     lastError = err.message;
     console.error('[poll] error:', err.message);
-  } finally {
-    setTimeout(pollLoop, POLL_INTERVAL_MS);
+
+    const bannedUntil = parseBannedUntil(err.body);
+    if (bannedUntil) {
+      // 차단 해제 시각까지 + 여유 10초 대기 (그 전까지는 재시도해봐야 계속 차단만 연장됨)
+      nextDelay = Math.max(bannedUntil - Date.now(), 5000) + 10000;
+      console.error(`[poll] IP banned by Binance. Waiting ${Math.round(nextDelay / 1000)}s before retrying.`);
+    } else if (err.statusCode === 429) {
+      nextDelay = POLL_INTERVAL_MS * 5; // 일반 rate limit이면 넉넉히 백오프
+    } else {
+      nextDelay = POLL_INTERVAL_MS * 2; // 그 외 에러도 약간 백오프
+    }
   }
+  setTimeout(pollLoop, nextDelay);
 }
 
 const server = http.createServer((req, res) => {
