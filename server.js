@@ -2,9 +2,34 @@
 // 반드시 한국 밖(예: Glitch/Render의 미국·싱가포르 리전)에 배포해야 우회 효과가 있습니다.
 import { WebSocketServer, WebSocket } from 'ws';
 import http from 'http';
+import https from 'https';
 
 const PORT = process.env.PORT || 3000;
 const BINANCE_WS_URL = 'wss://fstream.binance.com/ws/!ticker@arr';
+
+// 시작 시 REST API로 바이낸스 접속 자체가 되는지 별도로 확인
+function testRestConnectivity() {
+  https.get('https://fapi.binance.com/fapi/v1/ping', (res) => {
+    let body = '';
+    res.on('data', (c) => (body += c));
+    res.on('end', () => {
+      console.log(`[rest-test] status=${res.statusCode} body=${body.slice(0, 200)}`);
+    });
+  }).on('error', (err) => {
+    console.log('[rest-test] FAILED:', err.message);
+  });
+
+  https.get('https://fapi.binance.com/fapi/v1/ticker/24hr?symbol=BTCUSDT', (res) => {
+    let body = '';
+    res.on('data', (c) => (body += c));
+    res.on('end', () => {
+      console.log(`[rest-test-ticker] status=${res.statusCode} bodyLen=${body.length} sample=${body.slice(0, 150)}`);
+    });
+  }).on('error', (err) => {
+    console.log('[rest-test-ticker] FAILED:', err.message);
+  });
+}
+testRestConnectivity();
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
