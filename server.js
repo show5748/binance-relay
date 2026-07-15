@@ -36,7 +36,34 @@ function httpsGetJson(url) {
   });
 }
 
-// 429/418 응답 바디에서 "banned until 1234567890123" 형태의 타임스탬프를 파싱
+function httpsGetText(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+      let body = '';
+      res.on('data', (c) => (body += c));
+      res.on('end', () => {
+        if (res.statusCode !== 200) {
+          reject(new Error(`status ${res.statusCode}: ${body.slice(0, 200)}`));
+          return;
+        }
+        resolve(body);
+      });
+    }).on('error', reject);
+  });
+}
+
+// FRED의 fredgraph.csv는 API 키 없이 공개적으로 접근 가능한 CSV 다운로드 엔드포인트
+function parseFredCsv(csv) {
+  const lines = csv.trim().split('\n');
+  const rows = lines.slice(1).map((line) => {
+    const idx = line.indexOf(',');
+    const date = line.slice(0, idx);
+    const raw = line.slice(idx + 1).trim();
+    const value = raw === '.' || raw === '' ? null : parseFloat(raw);
+    return { date, value };
+  });
+  return rows.filter((r) => r.value !== null);
+}
 function parseBannedUntil(body) {
   const m = body && body.match(/banned until (\d+)/);
   return m ? parseInt(m[1], 10) : null;
@@ -85,14 +112,63 @@ async function pollLoop() {
   setTimeout(pollLoop, nextDelay);
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET');
+
+  let reqUrl;
+  try {
+    reqUrl = new URL(req.url, `http://${req.headers.host}`);
+  } catch (e) {
+    res.writeHead(400);
+    res.end('bad url');
+    return;
+  }
+
+  // 캔들차트용 klines 프록시: /klines?symbol=BTCUSDT&interval=15m&limit=200
+  if (reqUrl.pathname === '/klines') {
+    const symbol = (reqUrl.searchParams.get('symbol') || 'BTCUSDT').toUpperCase();
+    const interval = reqUrl.searchParams.get('interval') || '15m';
+    const limit = reqUrl.searchParams.get('limit') || '200';
+    try {
+      const data = await httpsGetJson(
+        `https://fapi.binance.com/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${encodeURIComponent(limit)}`
+      );
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(data));
+    } catch (err) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // 거시지표용 FRED 프록시: /macro?series=UNRATE&cosd=2022-01-01
+  if (reqUrl.pathname === '/macro') {
+    const series = reqUrl.searchParams.get('series') || 'UNRATE';
+    const cosd = reqUrl.searchParams.get('cosd') || '2022-01-01';
+    try {
+      const csv = await httpsGetText(
+        `https://fred.stlouisfed.org/graph/fredgraph.csv?id=${encodeURIComponent(series)}&cosd=${encodeURIComponent(cosd)}`
+      );
+      const rows = parseFredCsv(csv);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(rows));
+    } catch (err) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end(
     `Binance relay proxy (REST polling mode) running.\n` +
       `Connected clients: ${clients.size}\n` +
       `Poll count: ${pollCount}\n` +
       `Last success: ${lastSuccessAt}\n` +
-      `Last error: ${lastError}\n`
+      `Last error: ${lastError}\n` +
+      `Endpoints: /  /klines?symbol=BTCUSDT&interval=15m&limit=200  /macro?series=UNRATE\n`
   );
 });
 
