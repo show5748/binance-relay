@@ -31,6 +31,23 @@ function testRestConnectivity() {
 }
 testRestConnectivity();
 
+// 진단용: 단일 심볼 스트림은 데이터가 오는지 별도로 테스트
+function testSingleSymbolStream() {
+  const testWs = new WebSocket('wss://fstream.binance.com/ws/btcusdt@ticker');
+  let count = 0;
+  testWs.on('open', () => console.log('[test-single] connected to btcusdt@ticker'));
+  testWs.on('message', (data) => {
+    count++;
+    if (count === 1) console.log('[test-single] FIRST MESSAGE RECEIVED:', data.toString().slice(0, 150));
+  });
+  testWs.on('close', (code) => console.log('[test-single] closed, code=', code, 'totalReceived=', count));
+  testWs.on('error', (err) => console.log('[test-single] error:', err.message));
+  setInterval(() => {
+    console.log(`[test-single-status] receivedSoFar=${count}`);
+  }, 10000);
+}
+testSingleSymbolStream();
+
 const server = http.createServer((req, res) => {
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end(`Binance relay proxy is running. Connected clients: ${clients.size}, binance connected: ${binanceWs && binanceWs.readyState === WebSocket.OPEN}`);
