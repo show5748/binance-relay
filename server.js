@@ -13,9 +13,9 @@ let pollCount = 0;
 let lastError = null;
 let lastSuccessAt = null;
 
-function httpsGetJson(url) {
+function httpsGetJson(url, timeoutMs = 10000) {
   return new Promise((resolve, reject) => {
-    https.get(url, (res) => {
+    const req = https.get(url, (res) => {
       let body = '';
       res.on('data', (c) => (body += c));
       res.on('end', () => {
@@ -32,13 +32,17 @@ function httpsGetJson(url) {
           reject(e);
         }
       });
-    }).on('error', reject);
+    });
+    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`timeout after ${timeoutMs}ms: ${url}`));
+    });
   });
 }
 
-function httpsGetText(url) {
+function httpsGetText(url, timeoutMs = 10000) {
   return new Promise((resolve, reject) => {
-    https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
+    const req = https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
       let body = '';
       res.on('data', (c) => (body += c));
       res.on('end', () => {
@@ -48,8 +52,23 @@ function httpsGetText(url) {
         }
         resolve(body);
       });
-    }).on('error', reject);
+    });
+    req.on('error', reject);
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`timeout after ${timeoutMs}ms: ${url}`));
+    });
   });
+}
+
+// 실패시 한 번 더 재시도 (일시적 네트워크 문제 대응)
+async function withRetry(fn, retries = 1) {
+  try {
+    return await fn();
+  } catch (err) {
+    if (retries <= 0) throw err;
+    console.log('[retry] retrying after error:', err.message);
+    return withRetry(fn, retries - 1);
+  }
 }
 
 // FRED의 fredgraph.csv는 API 키 없이 공개적으로 접근 가능한 CSV 다운로드 엔드포인트
@@ -147,14 +166,16 @@ const server = http.createServer(async (req, res) => {
   if (reqUrl.pathname === '/macro') {
     const series = reqUrl.searchParams.get('series') || 'UNRATE';
     const cosd = reqUrl.searchParams.get('cosd') || '2022-01-01';
+    const targetUrl = `https://fred.stlouisfed.org/graph/fredgraph.csv?id=${encodeURIComponent(series)}&cosd=${encodeURIComponent(cosd)}`;
+    console.log('[macro] fetching', targetUrl);
     try {
-      const csv = await httpsGetText(
-        `https://fred.stlouisfed.org/graph/fredgraph.csv?id=${encodeURIComponent(series)}&cosd=${encodeURIComponent(cosd)}`
-      );
+      const csv = await withRetry(() => httpsGetText(targetUrl, 12000), 1);
       const rows = parseFredCsv(csv);
+      console.log(`[macro] ok series=${series} rows=${rows.length}`);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(rows));
     } catch (err) {
+      console.log('[macro] FAILED series=', series, 'error=', err.message);
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message }));
     }
