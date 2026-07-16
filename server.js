@@ -12,6 +12,9 @@ const TICKER_URL = 'https://fapi.binance.com/fapi/v1/ticker/24hr';
 let pollCount = 0;
 let lastError = null;
 let lastSuccessAt = null;
+let latestTickers = []; // 최신 24hr 티커 스냅샷 (스크리너가 상위 10개 뽑는 데 씀)
+let lastScreenerResult = null;
+let screenerRunning = false;
 
 function httpsGetJson(url, timeoutMs = 10000, headers = {}) {
   return new Promise((resolve, reject) => {
@@ -99,6 +102,7 @@ async function pollLoop() {
   try {
     const data = await httpsGetJson(TICKER_URL);
     const mapped = mapToWsFormat(data);
+    latestTickers = mapped;
     const payload = JSON.stringify(mapped);
     for (const client of clients) {
       if (client.readyState === WebSocket.OPEN) client.send(payload);
@@ -123,6 +127,110 @@ async function pollLoop() {
   }
   setTimeout(pollLoop, nextDelay);
 }
+
+const MA_PERIODS_SCREEN = [5, 10, 15, 20, 25, 30, 35];
+const DEVIATION_THRESHOLD_PCT = 5;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function maLast(closes, period) {
+  if (closes.length < period) return null;
+  const slice = closes.slice(closes.length - period);
+  return slice.reduce((a, b) => a + b, 0) / period;
+}
+
+// 상위 10개(24h 변동률 기준) 중, 2시간봉 5~35 이평이 정배열이 아니면서
+// 현재가가 MA5 대비 ±5% 이상 이격된 코인을 찾는 스크리너
+async function runScreenerJob() {
+  if (screenerRunning) {
+    console.log('[screener] already running, skip this trigger');
+    return;
+  }
+  if (!latestTickers.length) {
+    console.log('[screener] skip: no ticker snapshot yet');
+    return;
+  }
+  screenerRunning = true;
+  const startedAt = Date.now();
+  try {
+    const top10 = [...latestTickers]
+      .sort((a, b) => parseFloat(b.P) - parseFloat(a.P))
+      .slice(0, 10);
+
+    const results = [];
+    for (const t of top10) {
+      try {
+        const kl = await httpsGetJson(
+          `https://fapi.binance.com/fapi/v1/klines?symbol=${encodeURIComponent(t.s)}&interval=2h&limit=40`,
+          10000
+        );
+        const closes = kl.map((k) => parseFloat(k[4]));
+        const price = closes[closes.length - 1];
+
+        const maVals = {};
+        for (const p of MA_PERIODS_SCREEN) maVals[p] = maLast(closes, p);
+        if (Object.values(maVals).some((v) => v === null)) continue; // 데이터 부족 (상장 얼마 안 된 코인 등)
+
+        let aligned = true;
+        for (let i = 0; i < MA_PERIODS_SCREEN.length - 1; i++) {
+          const a = maVals[MA_PERIODS_SCREEN[i]];
+          const b = maVals[MA_PERIODS_SCREEN[i + 1]];
+          if (!(a > b)) { aligned = false; break; }
+        }
+
+        const deviationPct = ((price - maVals[5]) / maVals[5]) * 100;
+
+        if (!aligned && Math.abs(deviationPct) >= DEVIATION_THRESHOLD_PCT) {
+          results.push({
+            symbol: t.s,
+            price,
+            ma5: maVals[5],
+            deviationPct,
+            change24h: parseFloat(t.P),
+          });
+        }
+      } catch (err) {
+        console.log('[screener] symbol error', t.s, err.message);
+      }
+      await sleep(300); // 심볼 사이 살짝 텀 (레이트리밋 여유, 10개면 총 3초 정도)
+    }
+
+    lastScreenerResult = {
+      time: Date.now(),
+      scanned: top10.map((t) => t.s),
+      results,
+    };
+
+    console.log(`[screener] scan complete in ${Date.now()-startedAt}ms, matched=${results.length}/${top10.length}`);
+
+    const msg = JSON.stringify({ type: 'screener_result', ...lastScreenerResult });
+    for (const client of clients) {
+      if (client.readyState === WebSocket.OPEN) client.send(msg);
+    }
+  } finally {
+    screenerRunning = false;
+  }
+  return lastScreenerResult;
+}
+
+// 한국시간(KST, UTC+9) 기준 16,17,18,19,20,21,22,23,0시의 매시 58분에 실행
+// (17시~01시 구간을 2분 전에 커버하는 스케줄)
+const TARGET_KST_HOURS = new Set([16, 17, 18, 19, 20, 21, 22, 23, 0]);
+let lastScreenerRunKey = null;
+
+setInterval(() => {
+  const kst = new Date(Date.now() + 9 * 3600 * 1000); // UTC+9 KST는 DST 없음
+  const h = kst.getUTCHours();
+  const m = kst.getUTCMinutes();
+  const key = `${kst.getUTCFullYear()}-${kst.getUTCMonth()}-${kst.getUTCDate()}-${h}`;
+  if (m === 58 && TARGET_KST_HOURS.has(h) && lastScreenerRunKey !== key) {
+    lastScreenerRunKey = key;
+    console.log(`[screener] scheduled trigger at KST ${h}:${m}`);
+    runScreenerJob().catch((e) => console.log('[screener] job error:', e.message));
+  }
+}, 15000);
 
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
@@ -198,6 +306,26 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 이격도 스크리너: 마지막 결과 조회
+  if (reqUrl.pathname === '/screener/latest') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(lastScreenerResult || { time: null, scanned: [], results: [] }));
+    return;
+  }
+
+  // 이격도 스크리너: 수동 즉시 실행 (테스트용)
+  if (reqUrl.pathname === '/screener/run') {
+    try {
+      const result = await runScreenerJob();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result || { skipped: true }));
+    } catch (err) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end(
     `Binance relay proxy (REST polling mode) running.\n` +
@@ -205,7 +333,7 @@ const server = http.createServer(async (req, res) => {
       `Poll count: ${pollCount}\n` +
       `Last success: ${lastSuccessAt}\n` +
       `Last error: ${lastError}\n` +
-      `Endpoints: /  /klines?symbol=BTCUSDT&interval=15m&limit=200  /macro?series=UNRATE\n`
+      `Endpoints: /  /klines?symbol=BTCUSDT&interval=15m&limit=200  /macro?series=UNRATE  /screener/latest  /screener/run\n`
   );
 });
 
