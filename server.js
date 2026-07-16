@@ -8,15 +8,14 @@ import https from 'https';
 const PORT = process.env.PORT || 3000;
 const POLL_INTERVAL_MS = 10000; // 10초마다 REST 호출 (weight 40 * 6회/분 = 240/분, 한도 2400/분 대비 여유있게)
 const TICKER_URL = 'https://fapi.binance.com/fapi/v1/ticker/24hr';
-const FRED_API_KEY = 'd54bfa0524f0a898264fdc09fee254d3';
 
 let pollCount = 0;
 let lastError = null;
 let lastSuccessAt = null;
 
-function httpsGetJson(url, timeoutMs = 10000) {
+function httpsGetJson(url, timeoutMs = 10000, headers = {}) {
   return new Promise((resolve, reject) => {
-    const req = https.get(url, (res) => {
+    const req = https.get(url, { headers }, (res) => {
       let body = '';
       res.on('data', (c) => (body += c));
       res.on('end', () => {
@@ -41,26 +40,6 @@ function httpsGetJson(url, timeoutMs = 10000) {
   });
 }
 
-function httpsGetText(url, timeoutMs = 10000) {
-  return new Promise((resolve, reject) => {
-    const req = https.get(url, { headers: { 'User-Agent': 'Mozilla/5.0' } }, (res) => {
-      let body = '';
-      res.on('data', (c) => (body += c));
-      res.on('end', () => {
-        if (res.statusCode !== 200) {
-          reject(new Error(`status ${res.statusCode}: ${body.slice(0, 200)}`));
-          return;
-        }
-        resolve(body);
-      });
-    });
-    req.on('error', reject);
-    req.setTimeout(timeoutMs, () => {
-      req.destroy(new Error(`timeout after ${timeoutMs}ms: ${url}`));
-    });
-  });
-}
-
 // 실패시 한 번 더 재시도 (일시적 네트워크 문제 대응)
 async function withRetry(fn, retries = 1) {
   try {
@@ -72,17 +51,30 @@ async function withRetry(fn, retries = 1) {
   }
 }
 
-// FRED의 fredgraph.csv는 API 키 없이 공개적으로 접근 가능한 CSV 다운로드 엔드포인트
-function parseFredCsv(csv) {
-  const lines = csv.trim().split('\n');
-  const rows = lines.slice(1).map((line) => {
-    const idx = line.indexOf(',');
-    const date = line.slice(0, idx);
-    const raw = line.slice(idx + 1).trim();
-    const value = raw === '.' || raw === '' ? null : parseFloat(raw);
-    return { date, value };
-  });
-  return rows.filter((r) => r.value !== null);
+// BLS(미국 노동통계국) API 응답 파싱 (실업률, CPI, 근원CPI 공통)
+function parseBlsMonthly(json) {
+  const series = json.Results && json.Results.series && json.Results.series[0];
+  if (!series || !series.data) {
+    throw new Error('unexpected BLS response: ' + JSON.stringify(json).slice(0, 200));
+  }
+  return series.data
+    .filter((d) => /^M(0[1-9]|1[0-2])$/.test(d.period)) // M01~M12만 (M13 연평균 등 제외)
+    .map((d) => ({ date: `${d.year}-${d.period.slice(1)}-01`, value: parseFloat(d.value) }))
+    .reverse(); // BLS는 최신순으로 주므로 오름차순으로 뒤집음
+}
+
+// Yahoo Finance 차트 API 응답 파싱 (10년물 금리 ^TNX)
+function parseYahooChart(json) {
+  const result = json.chart && json.chart.result && json.chart.result[0];
+  if (!result) throw new Error('unexpected Yahoo response: ' + JSON.stringify(json).slice(0, 200));
+  const ts = result.timestamp || [];
+  const closes = (result.indicators && result.indicators.quote && result.indicators.quote[0] && result.indicators.quote[0].close) || [];
+  const rows = [];
+  for (let i = 0; i < ts.length; i++) {
+    if (closes[i] == null) continue;
+    rows.push({ date: new Date(ts[i] * 1000).toISOString().slice(0, 10), value: closes[i] });
+  }
+  return rows;
 }
 function parseBannedUntil(body) {
   const m = body && body.match(/banned until (\d+)/);
@@ -163,22 +155,38 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 거시지표용 FRED 공식 API 프록시: /macro?series=UNRATE&cosd=2022-01-01
+  // 거시지표 프록시: /macro?series=UNRATE&cosd=2022-01-01
+  // UNRATE/CPIAUCSL/CPILFESL -> BLS 공식 API,  DGS10 -> Yahoo Finance(^TNX)
   if (reqUrl.pathname === '/macro') {
     const series = reqUrl.searchParams.get('series') || 'UNRATE';
     const cosd = reqUrl.searchParams.get('cosd') || '2022-01-01';
-    const targetUrl =
-      `https://api.stlouisfed.org/fred/series/observations` +
-      `?series_id=${encodeURIComponent(series)}` +
-      `&api_key=${FRED_API_KEY}` +
-      `&file_type=json` +
-      `&observation_start=${encodeURIComponent(cosd)}`;
+    const startYear = parseInt(cosd.slice(0, 4), 10) || new Date().getFullYear() - 4;
+    const endYear = new Date().getFullYear();
     console.log('[macro] fetching series=', series);
+
     try {
-      const data = await withRetry(() => httpsGetJson(targetUrl, 12000), 1);
-      const rows = (data.observations || [])
-        .filter((o) => o.value !== '.')
-        .map((o) => ({ date: o.date, value: parseFloat(o.value) }));
+      let rows;
+      if (series === 'DGS10') {
+        const url = `https://query1.finance.yahoo.com/v8/finance/chart/%5ETNX?range=2y&interval=1d`;
+        const data = await withRetry(
+          () => httpsGetJson(url, 12000, { 'User-Agent': 'Mozilla/5.0' }),
+          1
+        );
+        rows = parseYahooChart(data);
+      } else {
+        const BLS_SERIES_ID = {
+          UNRATE: 'LNS14000000', // 실업률(계절조정)
+          CPIAUCSL: 'CUSR0000SA0', // CPI 전체(계절조정 지수)
+          CPILFESL: 'CUSR0000SA0L1E', // 근원 CPI(식품·에너지 제외, 계절조정 지수)
+        }[series];
+        if (!BLS_SERIES_ID) throw new Error('unknown series: ' + series);
+        const url = `https://api.bls.gov/publicAPI/v2/timeseries/data/${BLS_SERIES_ID}?startyear=${startYear}&endyear=${endYear}`;
+        const data = await withRetry(
+          () => httpsGetJson(url, 12000, { 'User-Agent': 'Mozilla/5.0' }),
+          1
+        );
+        rows = parseBlsMonthly(data);
+      }
       console.log(`[macro] ok series=${series} rows=${rows.length}`);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(rows));
