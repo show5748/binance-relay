@@ -8,6 +8,7 @@ import https from 'https';
 const PORT = process.env.PORT || 3000;
 const POLL_INTERVAL_MS = 10000; // 10초마다 REST 호출 (weight 40 * 6회/분 = 240/분, 한도 2400/분 대비 여유있게)
 const TICKER_URL = 'https://fapi.binance.com/fapi/v1/ticker/24hr';
+const FRED_API_KEY = 'd54bfa0524f0a898264fdc09fee254d3';
 
 let pollCount = 0;
 let lastError = null;
@@ -162,15 +163,22 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 거시지표용 FRED 프록시: /macro?series=UNRATE&cosd=2022-01-01
+  // 거시지표용 FRED 공식 API 프록시: /macro?series=UNRATE&cosd=2022-01-01
   if (reqUrl.pathname === '/macro') {
     const series = reqUrl.searchParams.get('series') || 'UNRATE';
     const cosd = reqUrl.searchParams.get('cosd') || '2022-01-01';
-    const targetUrl = `https://fred.stlouisfed.org/graph/fredgraph.csv?id=${encodeURIComponent(series)}&cosd=${encodeURIComponent(cosd)}`;
-    console.log('[macro] fetching', targetUrl);
+    const targetUrl =
+      `https://api.stlouisfed.org/fred/series/observations` +
+      `?series_id=${encodeURIComponent(series)}` +
+      `&api_key=${FRED_API_KEY}` +
+      `&file_type=json` +
+      `&observation_start=${encodeURIComponent(cosd)}`;
+    console.log('[macro] fetching series=', series);
     try {
-      const csv = await withRetry(() => httpsGetText(targetUrl, 12000), 1);
-      const rows = parseFredCsv(csv);
+      const data = await withRetry(() => httpsGetJson(targetUrl, 12000), 1);
+      const rows = (data.observations || [])
+        .filter((o) => o.value !== '.')
+        .map((o) => ({ date: o.date, value: parseFloat(o.value) }));
       console.log(`[macro] ok series=${series} rows=${rows.length}`);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(rows));
