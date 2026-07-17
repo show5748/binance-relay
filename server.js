@@ -9,6 +9,19 @@ const PORT = process.env.PORT || 3000;
 const POLL_INTERVAL_MS = 10000; // 10초마다 REST 호출 (weight 40 * 6회/분 = 240/분, 한도 2400/분 대비 여유있게)
 const TICKER_URL = 'https://fapi.binance.com/fapi/v1/ticker/24hr';
 
+const YAHOO_SYMBOLS = {
+  DGS10: '^TNX',
+  IXIC: '^IXIC',
+  KS11: '^KS11',
+  GOLD: 'GC=F',
+  WTI: 'CL=F',
+};
+const BLS_SERIES_ID = {
+  UNRATE: 'LNS14000000',
+  CPIAUCSL: 'CUSR0000SA0',
+  CPILFESL: 'CUSR0000SA0L1E',
+};
+
 let pollCount = 0;
 let lastError = null;
 let lastSuccessAt = null;
@@ -66,7 +79,7 @@ function parseBlsMonthly(json) {
     .reverse(); // BLS는 최신순으로 주므로 오름차순으로 뒤집음
 }
 
-// Yahoo Finance 차트 API 응답 파싱 (10년물 금리 ^TNX)
+// Yahoo Finance 차트 API 응답 파싱 (10년물 금리, 나스닥, 코스피, 금, WTI 공통)
 function parseYahooChart(json) {
   const result = json.chart && json.chart.result && json.chart.result[0];
   if (!result) throw new Error('unexpected Yahoo response: ' + JSON.stringify(json).slice(0, 200));
@@ -77,6 +90,17 @@ function parseYahooChart(json) {
     if (closes[i] == null) continue;
     rows.push({ date: new Date(ts[i] * 1000).toISOString().slice(0, 10), value: closes[i] });
   }
+  return rows;
+}
+
+// 뉴욕 연은 실효 기준금리(EFFR) 파싱 - 미국 기준금리 대용
+function parseNyFedEffr(json) {
+  const list = json.refRates || json.rates || [];
+  const rows = list
+    .filter((r) => r.type === 'EFFR' && r.percentRate != null)
+    .map((r) => ({ date: r.effectiveDate, value: parseFloat(r.percentRate) }))
+    .filter((r) => !isNaN(r.value));
+  rows.sort((a, b) => (a.date < b.date ? -1 : 1));
   return rows;
 }
 function parseBannedUntil(body) {
@@ -264,7 +288,7 @@ const server = http.createServer(async (req, res) => {
   }
 
   // 거시지표 프록시: /macro?series=UNRATE&cosd=2022-01-01
-  // UNRATE/CPIAUCSL/CPILFESL -> BLS 공식 API,  DGS10 -> Yahoo Finance(^TNX)
+  // UNRATE/CPIAUCSL/CPILFESL -> BLS, DGS10/IXIC/KS11/GOLD/WTI -> Yahoo, FEDFUNDS -> NY Fed EFFR
   if (reqUrl.pathname === '/macro') {
     const series = reqUrl.searchParams.get('series') || 'UNRATE';
     const cosd = reqUrl.searchParams.get('cosd') || '2022-01-01';
@@ -274,26 +298,29 @@ const server = http.createServer(async (req, res) => {
 
     try {
       let rows;
-      if (series === 'DGS10') {
-        const url = `https://query1.finance.yahoo.com/v8/finance/chart/%5ETNX?range=2y&interval=1d`;
+      if (YAHOO_SYMBOLS[series]) {
+        const url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(YAHOO_SYMBOLS[series])}?range=2y&interval=1d`;
         const data = await withRetry(
           () => httpsGetJson(url, 12000, { 'User-Agent': 'Mozilla/5.0' }),
           1
         );
         rows = parseYahooChart(data);
-      } else {
-        const BLS_SERIES_ID = {
-          UNRATE: 'LNS14000000', // 실업률(계절조정)
-          CPIAUCSL: 'CUSR0000SA0', // CPI 전체(계절조정 지수)
-          CPILFESL: 'CUSR0000SA0L1E', // 근원 CPI(식품·에너지 제외, 계절조정 지수)
-        }[series];
-        if (!BLS_SERIES_ID) throw new Error('unknown series: ' + series);
-        const url = `https://api.bls.gov/publicAPI/v2/timeseries/data/${BLS_SERIES_ID}?startyear=${startYear}&endyear=${endYear}`;
+      } else if (BLS_SERIES_ID[series]) {
+        const url = `https://api.bls.gov/publicAPI/v2/timeseries/data/${BLS_SERIES_ID[series]}?startyear=${startYear}&endyear=${endYear}`;
         const data = await withRetry(
           () => httpsGetJson(url, 12000, { 'User-Agent': 'Mozilla/5.0' }),
           1
         );
         rows = parseBlsMonthly(data);
+      } else if (series === 'FEDFUNDS') {
+        const url = `https://markets.newyorkfed.org/api/rates/all/search.json?startDate=${encodeURIComponent(cosd)}&type=rate`;
+        const data = await withRetry(
+          () => httpsGetJson(url, 12000, { 'User-Agent': 'Mozilla/5.0' }),
+          1
+        );
+        rows = parseNyFedEffr(data);
+      } else {
+        throw new Error('unknown series: ' + series);
       }
       console.log(`[macro] ok series=${series} rows=${rows.length}`);
       res.writeHead(200, { 'Content-Type': 'application/json' });
