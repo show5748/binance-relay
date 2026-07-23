@@ -274,11 +274,10 @@ const server = http.createServer(async (req, res) => {
     const symbol = (reqUrl.searchParams.get('symbol') || 'BTCUSDT').toUpperCase();
     const interval = reqUrl.searchParams.get('interval') || '15m';
     const limit = reqUrl.searchParams.get('limit') || '200';
-    const endTime = reqUrl.searchParams.get('endTime'); // 페이지네이션용 (과거로 더 거슬러 올라갈 때 사용)
     try {
-      let url = `https://fapi.binance.com/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${encodeURIComponent(limit)}`;
-      if (endTime) url += `&endTime=${encodeURIComponent(endTime)}`;
-      const data = await httpsGetJson(url);
+      const data = await httpsGetJson(
+        `https://fapi.binance.com/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${encodeURIComponent(limit)}`
+      );
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(data));
     } catch (err) {
