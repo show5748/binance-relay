@@ -152,22 +152,43 @@ async function pollLoop() {
   setTimeout(pollLoop, nextDelay);
 }
 
-const MA_PERIODS_SCREEN = [5, 10, 15, 20, 25, 30, 35];
-const DEVIATION_THRESHOLD_PCT = 5;
+const DEVIATION_THRESHOLD_PCT = 10;
+const BASE_KLINE_LIMIT = 500; // 1시간봉 500개 (20.8일치) - 20시간봉에서도 MA5 계산에 충분한 여유
+
+// 실행 시각(KST, N:58)에 어떤 시간봉을 확인할지 매핑
+// 16:58(17시 대응)->8h, 17:58(18시)->9h, ... 4:58(05시)->20h
+const RUN_HOUR_TO_TIMEFRAME = {
+  16: 8, 17: 9, 18: 10, 19: 11, 20: 12, 21: 13, 22: 14,
+  23: 15, 0: 16, 1: 17, 2: 18, 3: 19, 4: 20,
+};
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function maLast(closes, period) {
-  if (closes.length < period) return null;
-  const slice = closes.slice(closes.length - period);
+// 1시간봉 종가 배열을, 가장 최근 캔들 기준으로 뒤에서부터 hours개씩 묶어서
+// 합성 종가 배열을 만든다 (자체차트와 동일한 방식, MA 계산용으로는 종가만 있으면 충분)
+function aggregateClosesBackward(closes, hours) {
+  const out = [];
+  let end = closes.length;
+  while (end > 0) {
+    const start = Math.max(0, end - hours);
+    out.push(closes[end - 1]); // 이 구간의 마지막 종가
+    end = start;
+  }
+  out.reverse();
+  return out;
+}
+
+function maLast(values, period) {
+  if (values.length < period) return null;
+  const slice = values.slice(values.length - period);
   return slice.reduce((a, b) => a + b, 0) / period;
 }
 
-// 상위 10개(24h 변동률 기준) 중, 2시간봉 5~35 이평이 정배열이 아니면서
-// 현재가가 MA5 대비 ±5% 이상 이격된 코인을 찾는 스크리너
-async function runScreenerJob() {
+// 상위 10개(24h 변동률 기준) 각각을, 그 시각에 매핑된 시간봉 "딱 하나"로만 확인해서
+// 현재가가 MA5 대비 ±10% 이상 이격되면 기록하는 스크리너
+async function runScreenerJob(forcedHours) {
   if (screenerRunning) {
     console.log('[screener] already running, skip this trigger');
     return;
@@ -179,6 +200,13 @@ async function runScreenerJob() {
   screenerRunning = true;
   const startedAt = Date.now();
   try {
+    // 이번 실행에서 확인할 시간봉 하나 결정: 수동 호출시 forcedHours, 아니면 현재 KST 시각으로 매핑
+    let hours = forcedHours;
+    if (!hours) {
+      const kst = new Date(Date.now() + 9 * 3600 * 1000);
+      hours = RUN_HOUR_TO_TIMEFRAME[kst.getUTCHours()] || 8; // 스케줄 범위 밖이면 8h로 기본 테스트
+    }
+
     const top10 = [...latestTickers]
       .sort((a, b) => parseFloat(b.P) - parseFloat(a.P))
       .slice(0, 10);
@@ -187,30 +215,23 @@ async function runScreenerJob() {
     for (const t of top10) {
       try {
         const kl = await httpsGetJson(
-          `https://fapi.binance.com/fapi/v1/klines?symbol=${encodeURIComponent(t.s)}&interval=2h&limit=40`,
+          `https://fapi.binance.com/fapi/v1/klines?symbol=${encodeURIComponent(t.s)}&interval=1h&limit=${BASE_KLINE_LIMIT}`,
           10000
         );
         const closes = kl.map((k) => parseFloat(k[4]));
-        const price = closes[closes.length - 1];
 
-        const maVals = {};
-        for (const p of MA_PERIODS_SCREEN) maVals[p] = maLast(closes, p);
-        if (Object.values(maVals).some((v) => v === null)) continue; // 데이터 부족 (상장 얼마 안 된 코인 등)
+        const aggClose = aggregateClosesBackward(closes, hours);
+        const ma5 = maLast(aggClose, 5);
+        if (ma5 === null) continue; // 데이터 부족
+        const price = aggClose[aggClose.length - 1];
+        const deviationPct = ((price - ma5) / ma5) * 100;
 
-        let aligned = true;
-        for (let i = 0; i < MA_PERIODS_SCREEN.length - 1; i++) {
-          const a = maVals[MA_PERIODS_SCREEN[i]];
-          const b = maVals[MA_PERIODS_SCREEN[i + 1]];
-          if (!(a > b)) { aligned = false; break; }
-        }
-
-        const deviationPct = ((price - maVals[5]) / maVals[5]) * 100;
-
-        if (!aligned && Math.abs(deviationPct) >= DEVIATION_THRESHOLD_PCT) {
+        if (Math.abs(deviationPct) >= DEVIATION_THRESHOLD_PCT) {
           results.push({
             symbol: t.s,
+            hours,
             price,
-            ma5: maVals[5],
+            ma5,
             deviationPct,
             change24h: parseFloat(t.P),
           });
@@ -224,10 +245,11 @@ async function runScreenerJob() {
     lastScreenerResult = {
       time: Date.now(),
       scanned: top10.map((t) => t.s),
+      hours,
       results,
     };
 
-    console.log(`[screener] scan complete in ${Date.now()-startedAt}ms, matched=${results.length}/${top10.length}`);
+    console.log(`[screener] scan complete in ${Date.now()-startedAt}ms, hours=${hours}h, matched=${results.length}/${top10.length}`);
 
     const msg = JSON.stringify({ type: 'screener_result', ...lastScreenerResult });
     for (const client of clients) {
@@ -239,9 +261,8 @@ async function runScreenerJob() {
   return lastScreenerResult;
 }
 
-// 한국시간(KST, UTC+9) 기준 16,17,18,19,20,21,22,23,0시의 매시 58분에 실행
-// (17시~01시 구간을 2분 전에 커버하는 스케줄)
-const TARGET_KST_HOURS = new Set([16, 17, 18, 19, 20, 21, 22, 23, 0]);
+// 한국시간(KST, UTC+9) 기준 매시 58분에 실행 (17시~05시 구간을 2분 전에 커버하는 스케줄)
+const TARGET_KST_HOURS = new Set([16, 17, 18, 19, 20, 21, 22, 23, 0, 1, 2, 3, 4]);
 let lastScreenerRunKey = null;
 
 setInterval(() => {
@@ -252,7 +273,7 @@ setInterval(() => {
   if (m === 58 && TARGET_KST_HOURS.has(h) && lastScreenerRunKey !== key) {
     lastScreenerRunKey = key;
     console.log(`[screener] scheduled trigger at KST ${h}:${m}`);
-    runScreenerJob().catch((e) => console.log('[screener] job error:', e.message));
+    runScreenerJob(RUN_HOUR_TO_TIMEFRAME[h]).catch((e) => console.log('[screener] job error:', e.message));
   }
 }, 15000);
 
@@ -274,13 +295,24 @@ const server = http.createServer(async (req, res) => {
     const symbol = (reqUrl.searchParams.get('symbol') || 'BTCUSDT').toUpperCase();
     const interval = reqUrl.searchParams.get('interval') || '15m';
     const limit = reqUrl.searchParams.get('limit') || '200';
+    const endTime = reqUrl.searchParams.get('endTime'); // 페이지네이션용 (과거로 더 거슬러 올라갈 때 사용)
     try {
-      const data = await httpsGetJson(
-        `https://fapi.binance.com/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${encodeURIComponent(limit)}`
-      );
+      let url = `https://fapi.binance.com/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${encodeURIComponent(limit)}`;
+      if (endTime) url += `&endTime=${encodeURIComponent(endTime)}`;
+      console.log('[klines] outbound URL:', url);
+      const data = await httpsGetJson(url);
+      if (Array.isArray(data) && data.length > 0) {
+        const first = new Date(data[0][0]).toISOString();
+        const last = new Date(data[data.length - 1][0]).toISOString();
+        console.log(`[klines] response: ${data.length}개, 범위=${first} ~ ${last}`);
+      } else {
+        console.log('[klines] response: 빈 배열 또는 배열 아님', JSON.stringify(data).slice(0, 200));
+      }
+      res.setHeader('Cache-Control', 'no-store');
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(data));
     } catch (err) {
+      console.log('[klines] ERROR:', err.message);
       res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message }));
     }
@@ -343,7 +375,9 @@ const server = http.createServer(async (req, res) => {
   // 이격도 스크리너: 수동 즉시 실행 (테스트용)
   if (reqUrl.pathname === '/screener/run') {
     try {
-      const result = await runScreenerJob();
+      const hoursParam = reqUrl.searchParams.get('hours');
+      const forcedHours = hoursParam ? parseInt(hoursParam, 10) : undefined;
+      const result = await runScreenerJob(forcedHours);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(result || { skipped: true }));
     } catch (err) {
