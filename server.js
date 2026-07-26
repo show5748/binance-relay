@@ -365,6 +365,43 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 비트코인 김치프리미엄: 업비트(KRW) vs 바이낸스(USDT) × 원달러 환율
+  if (reqUrl.pathname === '/kimp') {
+    try {
+      const [upbitData, fxData] = await Promise.all([
+        httpsGetJson('https://api.upbit.com/v1/ticker?markets=KRW-BTC', 8000, { 'User-Agent': 'Mozilla/5.0' }),
+        httpsGetJson('https://query1.finance.yahoo.com/v8/finance/chart/KRW=X?range=5d&interval=1d', 8000, { 'User-Agent': 'Mozilla/5.0' }),
+      ]);
+
+      const upbitPrice = upbitData && upbitData[0] && upbitData[0].trade_price;
+      if (!upbitPrice) throw new Error('업비트 응답에서 가격을 찾을 수 없음');
+
+      const fxRows = parseYahooChart(fxData);
+      if (!fxRows.length) throw new Error('환율 데이터 없음');
+      const usdKrw = fxRows[fxRows.length - 1].value;
+
+      const btcTicker = latestTickers.find((t) => t.s === 'BTCUSDT');
+      if (!btcTicker) throw new Error('바이낸스 BTC 가격 아직 없음 (폴링 대기중)');
+      const binancePrice = parseFloat(btcTicker.c);
+
+      const premiumPct = (upbitPrice / (binancePrice * usdKrw) - 1) * 100;
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        time: Date.now(),
+        upbitPrice,
+        binancePrice,
+        usdKrw,
+        premiumPct,
+      }));
+    } catch (err) {
+      console.log('[kimp] FAILED:', err.message);
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
   // 이격도 스크리너: 마지막 결과 조회
   if (reqUrl.pathname === '/screener/latest') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
