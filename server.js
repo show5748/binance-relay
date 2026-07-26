@@ -402,6 +402,64 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 비트코인 김치프리미엄 히스토리 (일봉 기준 시계열)
+  if (reqUrl.pathname === '/kimp/history') {
+    try {
+      const days = Math.min(parseInt(reqUrl.searchParams.get('days') || '200', 10), 365);
+      const [upbitCandles, binanceCandles, fxData] = await Promise.all([
+        httpsGetJson(`https://api.upbit.com/v1/candles/days?market=KRW-BTC&count=${days}`, 10000, { 'User-Agent': 'Mozilla/5.0' }),
+        httpsGetJson(`https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1d&limit=${days}`, 10000),
+        httpsGetJson(`https://query1.finance.yahoo.com/v8/finance/chart/KRW=X?range=1y&interval=1d`, 10000, { 'User-Agent': 'Mozilla/5.0' }),
+      ]);
+
+      // 업비트: date(UTC 기준) -> 종가
+      const upbitByDate = new Map();
+      for (const c of upbitCandles) {
+        const date = c.candle_date_time_utc.slice(0, 10);
+        upbitByDate.set(date, c.trade_price);
+      }
+      // 바이낸스: date -> 종가
+      const binanceByDate = new Map();
+      for (const k of binanceCandles) {
+        const date = new Date(k[0]).toISOString().slice(0, 10);
+        binanceByDate.set(date, parseFloat(k[4]));
+      }
+      // 환율: date -> USD/KRW
+      const fxRows = parseYahooChart(fxData);
+      const fxByDate = new Map();
+      for (const r of fxRows) fxByDate.set(r.date, r.value);
+      const fxDatesSorted = fxRows.map((r) => r.date).sort();
+      function nearestFx(date) {
+        if (fxByDate.has(date)) return fxByDate.get(date);
+        // 환율은 주말에 데이터가 없을 수 있어 가장 가까운 이전 영업일 값을 사용
+        let candidate = null;
+        for (const d of fxDatesSorted) {
+          if (d <= date) candidate = d; else break;
+        }
+        return candidate ? fxByDate.get(candidate) : null;
+      }
+
+      const dates = Array.from(upbitByDate.keys()).sort();
+      const rows = [];
+      for (const date of dates) {
+        const upbitPrice = upbitByDate.get(date);
+        const binancePrice = binanceByDate.get(date);
+        const usdKrw = nearestFx(date);
+        if (!upbitPrice || !binancePrice || !usdKrw) continue;
+        const premiumPct = (upbitPrice / (binancePrice * usdKrw) - 1) * 100;
+        rows.push({ date, value: premiumPct });
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(rows));
+    } catch (err) {
+      console.log('[kimp/history] FAILED:', err.message);
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
   // 이격도 스크리너: 마지막 결과 조회
   if (reqUrl.pathname === '/screener/latest') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
