@@ -469,11 +469,30 @@ const server = http.createServer(async (req, res) => {
     while (all.length < totalDays) {
       let url = `https://api.upbit.com/v1/candles/days?market=KRW-BTC&count=${count}`;
       if (to) url += `&to=${encodeURIComponent(to)}`;
-      const batch = await httpsGetJson(url, 10000, { 'User-Agent': 'Mozilla/5.0' });
-      if (!batch.length) break;
+
+      let batch;
+      try {
+        batch = await httpsGetJson(url, 10000, { 'User-Agent': 'Mozilla/5.0' });
+      } catch (err) {
+        if (err.statusCode === 429) {
+          console.log('[kimp/candles] 업비트 429, 1.5초 대기 후 재시도');
+          await sleep(1500);
+          try {
+            batch = await httpsGetJson(url, 10000, { 'User-Agent': 'Mozilla/5.0' });
+          } catch (err2) {
+            console.log('[kimp/candles] 업비트 재시도도 실패:', err2.message);
+            break; // 여기까지 모은 데이터로 진행
+          }
+        } else {
+          throw err;
+        }
+      }
+
+      if (!batch || !batch.length) break;
       all = all.concat(batch); // 업비트는 최신순(내림차순)으로 줌
       to = batch[batch.length - 1].candle_date_time_utc;
       if (batch.length < count) break; // 더 이상 과거 데이터 없음
+      await sleep(250); // 요청 사이 텀 (레이트리밋 여유)
     }
     return all;
   }
