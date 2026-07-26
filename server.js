@@ -461,13 +461,47 @@ const server = http.createServer(async (req, res) => {
   }
 
   // 비트코인 김치프리미엄 - 일봉 OHLC 캔들 (업비트/바이낸스 각각의 일봉 O/H/L/C를 조합해 근사 계산)
+  // 업비트 일봉을 여러 페이지로 나눠서 가져옴 (최대 200개/요청)
+  async function fetchUpbitDailyPaginated(totalDays) {
+    let all = [];
+    let to = undefined;
+    const count = 200;
+    while (all.length < totalDays) {
+      let url = `https://api.upbit.com/v1/candles/days?market=KRW-BTC&count=${count}`;
+      if (to) url += `&to=${encodeURIComponent(to)}`;
+      const batch = await httpsGetJson(url, 10000, { 'User-Agent': 'Mozilla/5.0' });
+      if (!batch.length) break;
+      all = all.concat(batch); // 업비트는 최신순(내림차순)으로 줌
+      to = batch[batch.length - 1].candle_date_time_utc;
+      if (batch.length < count) break; // 더 이상 과거 데이터 없음
+    }
+    return all;
+  }
+
+  // 바이낸스 일봉을 여러 페이지로 나눠서 가져옴 (최대 1500개/요청)
+  async function fetchBinanceDailyPaginated(totalDays) {
+    let all = [];
+    let endTime = undefined;
+    const limit = 1500;
+    while (all.length < totalDays) {
+      let url = `https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1d&limit=${limit}`;
+      if (endTime) url += `&endTime=${endTime}`;
+      const batch = await httpsGetJson(url, 10000);
+      if (!batch.length) break;
+      all = batch.concat(all); // 오래된 페이지를 앞에 붙임
+      endTime = batch[0][0] - 1;
+      if (batch.length < limit) break;
+    }
+    return all;
+  }
+
   if (reqUrl.pathname === '/kimp/candles') {
     try {
-      const days = Math.min(parseInt(reqUrl.searchParams.get('days') || '200', 10), 365);
+      const days = Math.min(parseInt(reqUrl.searchParams.get('days') || '200', 10), 2600); // 2600일 ≈ 7.1년, 2020년 이전까지 커버
       const [upbitCandles, binanceCandles, fxData] = await Promise.all([
-        httpsGetJson(`https://api.upbit.com/v1/candles/days?market=KRW-BTC&count=${days}`, 10000, { 'User-Agent': 'Mozilla/5.0' }),
-        httpsGetJson(`https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1d&limit=${days}`, 10000),
-        httpsGetJson(`https://query1.finance.yahoo.com/v8/finance/chart/KRW=X?range=1y&interval=1d`, 10000, { 'User-Agent': 'Mozilla/5.0' }),
+        fetchUpbitDailyPaginated(days),
+        fetchBinanceDailyPaginated(days),
+        httpsGetJson(`https://query1.finance.yahoo.com/v8/finance/chart/KRW=X?range=10y&interval=1d`, 10000, { 'User-Agent': 'Mozilla/5.0' }),
       ]);
 
       const upbitByDate = new Map();
@@ -508,6 +542,7 @@ const server = http.createServer(async (req, res) => {
         candles.push({ date, o, h: Math.max(o, h, l, c), l: Math.min(o, h, l, c), c });
       }
 
+      console.log(`[kimp/candles] days=${days} upbit=${upbitCandles.length} binance=${binanceCandles.length} matched=${candles.length}`);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(candles));
     } catch (err) {
