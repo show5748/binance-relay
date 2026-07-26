@@ -460,6 +460,64 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 비트코인 김치프리미엄 - 일봉 OHLC 캔들 (업비트/바이낸스 각각의 일봉 O/H/L/C를 조합해 근사 계산)
+  if (reqUrl.pathname === '/kimp/candles') {
+    try {
+      const days = Math.min(parseInt(reqUrl.searchParams.get('days') || '200', 10), 365);
+      const [upbitCandles, binanceCandles, fxData] = await Promise.all([
+        httpsGetJson(`https://api.upbit.com/v1/candles/days?market=KRW-BTC&count=${days}`, 10000, { 'User-Agent': 'Mozilla/5.0' }),
+        httpsGetJson(`https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1d&limit=${days}`, 10000),
+        httpsGetJson(`https://query1.finance.yahoo.com/v8/finance/chart/KRW=X?range=1y&interval=1d`, 10000, { 'User-Agent': 'Mozilla/5.0' }),
+      ]);
+
+      const upbitByDate = new Map();
+      for (const c of upbitCandles) {
+        const date = c.candle_date_time_utc.slice(0, 10);
+        upbitByDate.set(date, { o: c.opening_price, h: c.high_price, l: c.low_price, c: c.trade_price });
+      }
+      const binanceByDate = new Map();
+      for (const k of binanceCandles) {
+        const date = new Date(k[0]).toISOString().slice(0, 10);
+        binanceByDate.set(date, { o: parseFloat(k[1]), h: parseFloat(k[2]), l: parseFloat(k[3]), c: parseFloat(k[4]) });
+      }
+      const fxRows = parseYahooChart(fxData);
+      const fxByDate = new Map();
+      for (const r of fxRows) fxByDate.set(r.date, r.value);
+      const fxDatesSorted = fxRows.map((r) => r.date).sort();
+      function nearestFx(date) {
+        if (fxByDate.has(date)) return fxByDate.get(date);
+        let candidate = null;
+        for (const d of fxDatesSorted) {
+          if (d <= date) candidate = d; else break;
+        }
+        return candidate ? fxByDate.get(candidate) : null;
+      }
+
+      const dates = Array.from(upbitByDate.keys()).sort();
+      const candles = [];
+      for (const date of dates) {
+        const u = upbitByDate.get(date);
+        const b = binanceByDate.get(date);
+        const usdKrw = nearestFx(date);
+        if (!u || !b || !usdKrw) continue;
+        // 고가/저가는 "그날 있을 수 있었던 최대/최소 이격"으로 근사 (업비트 고가 vs 바이낸스 저가 = 최대 이격, 그 반대는 최소)
+        const o = (u.o / (b.o * usdKrw) - 1) * 100;
+        const h = (u.h / (b.l * usdKrw) - 1) * 100;
+        const l = (u.l / (b.h * usdKrw) - 1) * 100;
+        const c = (u.c / (b.c * usdKrw) - 1) * 100;
+        candles.push({ date, o, h: Math.max(o, h, l, c), l: Math.min(o, h, l, c), c });
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(candles));
+    } catch (err) {
+      console.log('[kimp/candles] FAILED:', err.message);
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
   // 이격도 스크리너: 마지막 결과 조회
   if (reqUrl.pathname === '/screener/latest') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
