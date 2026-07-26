@@ -28,6 +28,39 @@ let lastSuccessAt = null;
 let latestTickers = []; // 최신 24hr 티커 스냅샷 (스크리너가 상위 10개 뽑는 데 씀)
 let lastScreenerResult = null;
 let screenerRunning = false;
+let binanceBannedUntil = 0; // 바이낸스 IP 차단 해제 예정 시각 (서버 전체가 공유)
+
+function isBinanceBanned() {
+  return Date.now() < binanceBannedUntil;
+}
+function binanceBanRemainingSec() {
+  return Math.max(0, Math.ceil((binanceBannedUntil - Date.now()) / 1000));
+}
+function noteBinanceBan(body) {
+  const t = parseBannedUntil(body);
+  if (t && t > binanceBannedUntil) {
+    binanceBannedUntil = t;
+    console.log(`[binance-ban] 차단 감지, 해제 예정: ${new Date(t).toISOString()} (${binanceBanRemainingSec()}초 후)`);
+  }
+}
+
+// fapi.binance.com 호출 전용 래퍼: 이미 차단 중이면 요청 자체를 안 보내고,
+// 새로 차단 응답을 받으면 전역 상태에 기록해서 다른 곳들도 즉시 멈추게 함
+async function httpsGetJsonBinance(url, timeoutMs = 10000) {
+  if (isBinanceBanned()) {
+    const err = new Error(`바이낸스 IP 차단 중 (${binanceBanRemainingSec()}초 후 해제 예정) - 요청 생략`);
+    err.isBanSkip = true;
+    throw err;
+  }
+  try {
+    return await httpsGetJson(url, timeoutMs);
+  } catch (err) {
+    if (err.statusCode === 418 || err.statusCode === 429) {
+      noteBinanceBan(err.body);
+    }
+    throw err;
+  }
+}
 
 function httpsGetJson(url, timeoutMs = 10000, headers = {}) {
   return new Promise((resolve, reject) => {
@@ -124,7 +157,7 @@ function mapToWsFormat(restArr) {
 async function pollLoop() {
   let nextDelay = POLL_INTERVAL_MS;
   try {
-    const data = await httpsGetJson(TICKER_URL);
+    const data = await httpsGetJsonBinance(TICKER_URL);
     const mapped = mapToWsFormat(data);
     latestTickers = mapped;
     const payload = JSON.stringify(mapped);
@@ -138,10 +171,9 @@ async function pollLoop() {
     lastError = err.message;
     console.error('[poll] error:', err.message);
 
-    const bannedUntil = parseBannedUntil(err.body);
-    if (bannedUntil) {
+    if (isBinanceBanned()) {
       // 차단 해제 시각까지 + 여유 10초 대기 (그 전까지는 재시도해봐야 계속 차단만 연장됨)
-      nextDelay = Math.max(bannedUntil - Date.now(), 5000) + 10000;
+      nextDelay = binanceBanRemainingSec() * 1000 + 10000;
       console.error(`[poll] IP banned by Binance. Waiting ${Math.round(nextDelay / 1000)}s before retrying.`);
     } else if (err.statusCode === 429) {
       nextDelay = POLL_INTERVAL_MS * 5; // 일반 rate limit이면 넉넉히 백오프
@@ -214,7 +246,7 @@ async function runScreenerJob(forcedHours) {
     const results = [];
     for (const t of top10) {
       try {
-        const kl = await httpsGetJson(
+        const kl = await httpsGetJsonBinance(
           `https://fapi.binance.com/fapi/v1/klines?symbol=${encodeURIComponent(t.s)}&interval=1h&limit=${BASE_KLINE_LIMIT}`,
           10000
         );
@@ -238,6 +270,10 @@ async function runScreenerJob(forcedHours) {
         }
       } catch (err) {
         console.log('[screener] symbol error', t.s, err.message);
+        if (err.isBanSkip) {
+          console.log('[screener] 바이낸스 차단 중이라 나머지 심볼은 건너뜀');
+          break;
+        }
       }
       await sleep(300); // 심볼 사이 살짝 텀 (레이트리밋 여유, 10개면 총 3초 정도)
     }
@@ -299,22 +335,14 @@ const server = http.createServer(async (req, res) => {
     try {
       let url = `https://fapi.binance.com/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=${encodeURIComponent(interval)}&limit=${encodeURIComponent(limit)}`;
       if (endTime) url += `&endTime=${encodeURIComponent(endTime)}`;
-      console.log('[klines] outbound URL:', url);
-      const data = await httpsGetJson(url);
-      if (Array.isArray(data) && data.length > 0) {
-        const first = new Date(data[0][0]).toISOString();
-        const last = new Date(data[data.length - 1][0]).toISOString();
-        console.log(`[klines] response: ${data.length}개, 범위=${first} ~ ${last}`);
-      } else {
-        console.log('[klines] response: 빈 배열 또는 배열 아님', JSON.stringify(data).slice(0, 200));
-      }
+      const data = await httpsGetJsonBinance(url);
       res.setHeader('Cache-Control', 'no-store');
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(data));
     } catch (err) {
       console.log('[klines] ERROR:', err.message);
-      res.writeHead(502, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: err.message }));
+      res.writeHead(err.isBanSkip ? 429 : 502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message, bannedRemainingSec: isBinanceBanned() ? binanceBanRemainingSec() : undefined }));
     }
     return;
   }
@@ -408,7 +436,7 @@ const server = http.createServer(async (req, res) => {
       const days = Math.min(parseInt(reqUrl.searchParams.get('days') || '200', 10), 365);
       const [upbitCandles, binanceCandles, fxData] = await Promise.all([
         httpsGetJson(`https://api.upbit.com/v1/candles/days?market=KRW-BTC&count=${days}`, 10000, { 'User-Agent': 'Mozilla/5.0' }),
-        httpsGetJson(`https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1d&limit=${days}`, 10000),
+        httpsGetJsonBinance(`https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1d&limit=${days}`, 10000),
         httpsGetJson(`https://query1.finance.yahoo.com/v8/finance/chart/KRW=X?range=1y&interval=1d`, 10000, { 'User-Agent': 'Mozilla/5.0' }),
       ]);
 
@@ -505,7 +533,13 @@ const server = http.createServer(async (req, res) => {
     while (all.length < totalDays) {
       let url = `https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=1d&limit=${limit}`;
       if (endTime) url += `&endTime=${endTime}`;
-      const batch = await httpsGetJson(url, 10000);
+      let batch;
+      try {
+        batch = await httpsGetJsonBinance(url, 10000);
+      } catch (err) {
+        console.log('[kimp/candles] 바이낸스 호출 중단:', err.message);
+        break; // 차단 등으로 실패하면 여기까지 모은 데이터로 진행
+      }
       if (!batch.length) break;
       all = batch.concat(all); // 오래된 페이지를 앞에 붙임
       endTime = batch[0][0] - 1;
@@ -601,6 +635,7 @@ const server = http.createServer(async (req, res) => {
       `Poll count: ${pollCount}\n` +
       `Last success: ${lastSuccessAt}\n` +
       `Last error: ${lastError}\n` +
+      `Binance banned: ${isBinanceBanned() ? `YES, ${binanceBanRemainingSec()}s remaining` : 'no'}\n` +
       `Endpoints: /  /klines?symbol=BTCUSDT&interval=15m&limit=200  /macro?series=UNRATE  /screener/latest  /screener/run\n`
   );
 });
