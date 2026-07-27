@@ -6,7 +6,7 @@ import http from 'http';
 import https from 'https';
 
 const PORT = process.env.PORT || 3000;
-const POLL_INTERVAL_MS = 10000; // 10초마다 REST 호출 (weight 40 * 6회/분 = 240/분, 한도 2400/분 대비 여유있게)
+const POLL_INTERVAL_MS = 20000; // 20초마다 REST 호출 (weight 40 * 3회/분 = 120/분, 한도 2400/분 대비 넉넉한 여유)
 const TICKER_URL = 'https://fapi.binance.com/fapi/v1/ticker/24hr';
 
 const YAHOO_SYMBOLS = {
