@@ -420,22 +420,27 @@ const server = http.createServer(async (req, res) => {
   }
 
   // 업비트 KRW 마켓 전체 티커 (테이블 전체를 업비트로 전환할 때 사용)
-  // 마켓 목록은 자주 안 바뀌니 1시간 캐싱
+  // 마켓 목록은 자주 안 바뀌니 1시간 캐싱 (한글 이름도 같이 저장)
   if (reqUrl.pathname === '/upbit/tickers') {
     try {
       const now = Date.now();
       if (!upbitMarketsCache || now - upbitMarketsCacheAt > 3600000) {
         const all = await httpsGetJson('https://api.upbit.com/v1/market/all?isDetails=false', 10000, { 'User-Agent': 'Mozilla/5.0' });
-        upbitMarketsCache = all.filter((m) => m.market.startsWith('KRW-')).map((m) => m.market);
+        upbitMarketsCache = all
+          .filter((m) => m.market.startsWith('KRW-'))
+          .map((m) => ({ market: m.market, koreanName: m.korean_name }));
         upbitMarketsCacheAt = now;
       }
+      const nameByMarket = new Map(upbitMarketsCache.map((m) => [m.market, m.koreanName]));
+      const marketList = upbitMarketsCache.map((m) => m.market).join(',');
       const data = await httpsGetJson(
-        `https://api.upbit.com/v1/ticker?markets=${upbitMarketsCache.join(',')}`,
+        `https://api.upbit.com/v1/ticker?markets=${marketList}`,
         10000,
         { 'User-Agent': 'Mozilla/5.0' }
       );
       const mapped = data.map((t) => ({
         market: t.market,
+        koreanName: nameByMarket.get(t.market) || '',
         price: t.trade_price,
         changePct24h: t.signed_change_rate * 100,
         volume24h: t.acc_trade_price_24h,
