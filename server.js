@@ -222,6 +222,25 @@ function maLast(values, period) {
 
 // 상위 10개(24h 변동률 기준) 각각을, 그 시각에 매핑된 시간봉 "딱 하나"로만 확인해서
 // 현재가가 MA5 대비 ±10% 이상 이격되면 기록하는 스크리너
+// 업비트 KRW 마켓 상위 5개(24h 변동률 기준) 조회 - 이격 스크리너용
+async function fetchUpbitTop5() {
+  const now = Date.now();
+  if (!upbitMarketsCache || now - upbitMarketsCacheAt > 3600000) {
+    const all = await httpsGetJson('https://api.upbit.com/v1/market/all?isDetails=false', 10000, { 'User-Agent': 'Mozilla/5.0' });
+    upbitMarketsCache = all
+      .filter((m) => m.market.startsWith('KRW-'))
+      .map((m) => ({ market: m.market, koreanName: m.korean_name }));
+    upbitMarketsCacheAt = now;
+  }
+  const nameByMarket = new Map(upbitMarketsCache.map((m) => [m.market, m.koreanName]));
+  const marketList = upbitMarketsCache.map((m) => m.market).join(',');
+  const data = await httpsGetJson(`https://api.upbit.com/v1/ticker?markets=${marketList}`, 10000, { 'User-Agent': 'Mozilla/5.0' });
+  return data
+    .map((t) => ({ market: t.market, koreanName: nameByMarket.get(t.market) || '', changePct24h: t.signed_change_rate * 100 }))
+    .sort((a, b) => b.changePct24h - a.changePct24h)
+    .slice(0, 5);
+}
+
 async function runScreenerJob(forcedHours) {
   if (screenerRunning) {
     console.log('[screener] already running, skip this trigger');
@@ -262,6 +281,7 @@ async function runScreenerJob(forcedHours) {
 
         if (Math.abs(deviationPct) >= DEVIATION_THRESHOLD_PCT) {
           results.push({
+            exchange: 'binance',
             symbol: t.s,
             hours,
             price,
@@ -280,14 +300,65 @@ async function runScreenerJob(forcedHours) {
       await sleep(300); // 심볼 사이 살짝 텀 (레이트리밋 여유, 10개면 총 3초 정도)
     }
 
+    // 업비트 상위 5개(24h 변동률 기준)도 같은 방식으로 확인
+    const upbitTop5 = await fetchUpbitTop5().catch((err) => {
+      console.log('[screener] 업비트 상위5 조회 실패:', err.message);
+      return [];
+    });
+    for (const u of upbitTop5) {
+      try {
+        const kl = await httpsGetJson(
+          `https://api.upbit.com/v1/candles/minutes/60?market=${encodeURIComponent(u.market)}&count=200`,
+          10000,
+          { 'User-Agent': 'Mozilla/5.0' }
+        );
+        const closes = kl.map((c) => c.trade_price).reverse(); // 업비트는 최신순 -> 오름차순으로
+
+        const aggClose = aggregateClosesBackward(closes, hours);
+        const ma5 = maLast(aggClose, 5);
+        if (ma5 === null) continue;
+        const price = aggClose[aggClose.length - 1];
+        const deviationPct = ((price - ma5) / ma5) * 100;
+
+        if (Math.abs(deviationPct) >= DEVIATION_THRESHOLD_PCT) {
+          results.push({
+            exchange: 'upbit',
+            symbol: u.market,
+            koreanName: u.koreanName,
+            hours,
+            price,
+            ma5,
+            deviationPct,
+            change24h: u.changePct24h,
+          });
+        }
+      } catch (err) {
+        console.log('[screener] 업비트 심볼 에러', u.market, err.message);
+      }
+      await sleep(250);
+    }
+
+    // 같은 코인이 양쪽에 다 걸리면 바이낸스 쪽을 우선하고 업비트 중복은 제거
+    // (안 겹치는 업비트 항목은 한글 이름이 붙어있어서 "업비트에만 상장된 코인"임이 자연스럽게 드러남)
+    const baseAssetOf = (r) => r.exchange === 'binance' ? r.symbol.replace(/USDT$/, '') : r.symbol.replace(/^KRW-/, '');
+    const dedupedByBase = new Map();
+    for (const r of results) {
+      const base = baseAssetOf(r);
+      const existing = dedupedByBase.get(base);
+      if (!existing || (existing.exchange === 'upbit' && r.exchange === 'binance')) {
+        dedupedByBase.set(base, r);
+      }
+    }
+    const dedupedResults = Array.from(dedupedByBase.values());
+
     lastScreenerResult = {
       time: Date.now(),
-      scanned: top10.map((t) => t.s),
+      scanned: [...top10.map((t) => t.s), ...upbitTop5.map((u) => u.market)],
       hours,
-      results,
+      results: dedupedResults,
     };
 
-    console.log(`[screener] scan complete in ${Date.now()-startedAt}ms, hours=${hours}h, matched=${results.length}/${top10.length}`);
+    console.log(`[screener] scan complete in ${Date.now()-startedAt}ms, hours=${hours}h, matched=${dedupedResults.length} (원본 ${results.length}건 중 중복제거)`);
 
     const msg = JSON.stringify({ type: 'screener_result', ...lastScreenerResult });
     for (const client of clients) {
