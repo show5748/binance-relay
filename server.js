@@ -26,6 +26,8 @@ let pollCount = 0;
 let lastError = null;
 let lastSuccessAt = null;
 let latestTickers = []; // 최신 24hr 티커 스냅샷 (스크리너가 상위 10개 뽑는 데 씀)
+let upbitMarketsCache = null;
+let upbitMarketsCacheAt = 0;
 let lastScreenerResult = null;
 let screenerRunning = false;
 let binanceBannedUntil = 0; // 바이낸스 IP 차단 해제 예정 시각 (서버 전체가 공유)
@@ -412,6 +414,38 @@ const server = http.createServer(async (req, res) => {
     } catch (err) {
       console.log('[upbit/klines] FAILED:', market, err.message);
       res.writeHead(err.statusCode === 404 ? 404 : 502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // 업비트 KRW 마켓 전체 티커 (테이블 전체를 업비트로 전환할 때 사용)
+  // 마켓 목록은 자주 안 바뀌니 1시간 캐싱
+  if (reqUrl.pathname === '/upbit/tickers') {
+    try {
+      const now = Date.now();
+      if (!upbitMarketsCache || now - upbitMarketsCacheAt > 3600000) {
+        const all = await httpsGetJson('https://api.upbit.com/v1/market/all?isDetails=false', 10000, { 'User-Agent': 'Mozilla/5.0' });
+        upbitMarketsCache = all.filter((m) => m.market.startsWith('KRW-')).map((m) => m.market);
+        upbitMarketsCacheAt = now;
+      }
+      const data = await httpsGetJson(
+        `https://api.upbit.com/v1/ticker?markets=${upbitMarketsCache.join(',')}`,
+        10000,
+        { 'User-Agent': 'Mozilla/5.0' }
+      );
+      const mapped = data.map((t) => ({
+        market: t.market,
+        price: t.trade_price,
+        changePct24h: t.signed_change_rate * 100,
+        volume24h: t.acc_trade_price_24h,
+      }));
+      res.setHeader('Cache-Control', 'no-store');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(mapped));
+    } catch (err) {
+      console.log('[upbit/tickers] FAILED:', err.message);
+      res.writeHead(502, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message }));
     }
     return;
