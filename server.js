@@ -393,6 +393,30 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // 범용 업비트 캔들 프록시: /upbit/klines?market=KRW-BTC&unit=days&count=200
+  // unit: days | weeks | months | 1,3,5,10,15,30,60,240(분)
+  if (reqUrl.pathname === '/upbit/klines') {
+    const market = (reqUrl.searchParams.get('market') || 'KRW-BTC').toUpperCase();
+    const unit = reqUrl.searchParams.get('unit') || 'days';
+    const count = Math.min(parseInt(reqUrl.searchParams.get('count') || '200', 10), 200);
+    try {
+      let url;
+      if (unit === 'days') url = `https://api.upbit.com/v1/candles/days?market=${encodeURIComponent(market)}&count=${count}`;
+      else if (unit === 'weeks') url = `https://api.upbit.com/v1/candles/weeks?market=${encodeURIComponent(market)}&count=${count}`;
+      else if (unit === 'months') url = `https://api.upbit.com/v1/candles/months?market=${encodeURIComponent(market)}&count=${count}`;
+      else url = `https://api.upbit.com/v1/candles/minutes/${encodeURIComponent(unit)}?market=${encodeURIComponent(market)}&count=${count}`;
+      const data = await httpsGetJson(url, 10000, { 'User-Agent': 'Mozilla/5.0' });
+      res.setHeader('Cache-Control', 'no-store');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(data));
+    } catch (err) {
+      console.log('[upbit/klines] FAILED:', market, err.message);
+      res.writeHead(err.statusCode === 404 ? 404 : 502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
   // 비트코인 김치프리미엄: 업비트(KRW) vs 바이낸스(USDT) × 원달러 환율
   if (reqUrl.pathname === '/kimp') {
     try {
