@@ -471,7 +471,8 @@ const server = http.createServer(async (req, res) => {
   if (reqUrl.pathname === '/upbit/klines') {
     const market = (reqUrl.searchParams.get('market') || 'KRW-BTC').toUpperCase();
     const unit = reqUrl.searchParams.get('unit') || 'days';
-    const count = Math.min(parseInt(reqUrl.searchParams.get('count') || '200', 10), 600); // 최대 600개(3페이지)로 제한 - 속도 우선
+    const count = Math.min(parseInt(reqUrl.searchParams.get('count') || '200', 10), 1200); // 최대 1200개(6페이지, 병렬 요청)
+    const UPBIT_UNIT_MINUTES = { '1':1,'3':3,'5':5,'10':10,'15':15,'30':30,'60':60,'240':240, days:1440, weeks:10080, months:43200 };
     try {
       function buildUrl(pageCount, to) {
         let base;
@@ -483,17 +484,33 @@ const server = http.createServer(async (req, res) => {
         return base;
       }
 
-      let all = [];
-      let to = undefined;
-      while (all.length < count) {
-        const pageCount = Math.min(200, count - all.length);
-        const batch = await httpsGetJson(buildUrl(pageCount, to), 10000, { 'User-Agent': 'Mozilla/5.0' });
-        if (!batch.length) break;
-        all = all.concat(batch); // 업비트는 최신순(내림차순)으로 줌
-        to = batch[batch.length - 1].candle_date_time_utc;
-        if (batch.length < pageCount) break; // 더 이상 과거 데이터 없음
-        if (all.length < count) await sleep(100); // 페이지 사이 살짝 텀
+      const pageSize = 200;
+      const pages = Math.ceil(count / pageSize);
+      const unitMs = (UPBIT_UNIT_MINUTES[unit] || 1440) * 60000;
+      const pageDurationMs = pageSize * unitMs;
+      const now = Date.now();
+
+      // 페이지별 'to' 시각을 미리 계산해서 한꺼번에 병렬로 요청
+      const requests = [];
+      for (let p = 0; p < pages; p++) {
+        const to = p === 0 ? undefined : new Date(now - p * pageDurationMs).toISOString();
+        const pageCount = Math.min(pageSize, count - p * pageSize);
+        requests.push(httpsGetJson(buildUrl(pageCount, to), 10000, { 'User-Agent': 'Mozilla/5.0' }));
       }
+      const results = await Promise.allSettled(requests);
+
+      let all = [];
+      for (const r of results) {
+        if (r.status === 'fulfilled') all = all.concat(r.value);
+      }
+      // 중복 제거 후 최신순(내림차순) 정렬 유지
+      const seen = new Set();
+      all = all.filter((c) => {
+        if (seen.has(c.candle_date_time_utc)) return false;
+        seen.add(c.candle_date_time_utc);
+        return true;
+      });
+      all.sort((a, b) => (a.candle_date_time_utc < b.candle_date_time_utc ? 1 : -1));
 
       res.setHeader('Cache-Control', 'no-store');
       res.writeHead(200, { 'Content-Type': 'application/json' });
