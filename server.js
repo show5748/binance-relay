@@ -193,7 +193,7 @@ const BASE_KLINE_LIMIT = 500; // 1시간봉 500개 (20.8일치) - 20시간봉에
 // 16:58(17시 대응)->8h, 17:58(18시)->9h, ... 4:58(05시)->20h
 const RUN_HOUR_TO_TIMEFRAME = {
   16: 8, 17: 9, 18: 10, 19: 11, 20: 12, 21: 13, 22: 14,
-  23: 15, 0: 16, 1: 17, 2: 18, 3: 19, 4: 20,
+  23: 15, 0: 16, 1: 17, 2: 18, 3: 19, 4: 20, 5: 21, 6: 22,
 };
 
 function sleep(ms) {
@@ -371,7 +371,7 @@ async function runScreenerJob(forcedHours) {
 }
 
 // 한국시간(KST, UTC+9) 기준 매시 58분에 실행 (17시~05시 구간을 2분 전에 커버하는 스케줄)
-const TARGET_KST_HOURS = new Set([16, 17, 18, 19, 20, 21, 22, 23, 0, 1, 2, 3, 4]);
+const TARGET_KST_HOURS = new Set([16, 17, 18, 19, 20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6]);
 let lastScreenerRunKey = null;
 
 setInterval(() => {
