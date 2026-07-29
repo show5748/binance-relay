@@ -471,17 +471,33 @@ const server = http.createServer(async (req, res) => {
   if (reqUrl.pathname === '/upbit/klines') {
     const market = (reqUrl.searchParams.get('market') || 'KRW-BTC').toUpperCase();
     const unit = reqUrl.searchParams.get('unit') || 'days';
-    const count = Math.min(parseInt(reqUrl.searchParams.get('count') || '200', 10), 200);
+    const count = Math.min(parseInt(reqUrl.searchParams.get('count') || '200', 10), 3000); // 최대 3000개 (200개씩 최대 15페이지)
     try {
-      let url;
-      if (unit === 'days') url = `https://api.upbit.com/v1/candles/days?market=${encodeURIComponent(market)}&count=${count}`;
-      else if (unit === 'weeks') url = `https://api.upbit.com/v1/candles/weeks?market=${encodeURIComponent(market)}&count=${count}`;
-      else if (unit === 'months') url = `https://api.upbit.com/v1/candles/months?market=${encodeURIComponent(market)}&count=${count}`;
-      else url = `https://api.upbit.com/v1/candles/minutes/${encodeURIComponent(unit)}?market=${encodeURIComponent(market)}&count=${count}`;
-      const data = await httpsGetJson(url, 10000, { 'User-Agent': 'Mozilla/5.0' });
+      function buildUrl(pageCount, to) {
+        let base;
+        if (unit === 'days') base = `https://api.upbit.com/v1/candles/days?market=${encodeURIComponent(market)}&count=${pageCount}`;
+        else if (unit === 'weeks') base = `https://api.upbit.com/v1/candles/weeks?market=${encodeURIComponent(market)}&count=${pageCount}`;
+        else if (unit === 'months') base = `https://api.upbit.com/v1/candles/months?market=${encodeURIComponent(market)}&count=${pageCount}`;
+        else base = `https://api.upbit.com/v1/candles/minutes/${encodeURIComponent(unit)}?market=${encodeURIComponent(market)}&count=${pageCount}`;
+        if (to) base += `&to=${encodeURIComponent(to)}`;
+        return base;
+      }
+
+      let all = [];
+      let to = undefined;
+      while (all.length < count) {
+        const pageCount = Math.min(200, count - all.length);
+        const batch = await httpsGetJson(buildUrl(pageCount, to), 10000, { 'User-Agent': 'Mozilla/5.0' });
+        if (!batch.length) break;
+        all = all.concat(batch); // 업비트는 최신순(내림차순)으로 줌
+        to = batch[batch.length - 1].candle_date_time_utc;
+        if (batch.length < pageCount) break; // 더 이상 과거 데이터 없음
+        if (all.length < count) await sleep(200); // 페이지 사이 살짝 텀
+      }
+
       res.setHeader('Cache-Control', 'no-store');
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(data));
+      res.end(JSON.stringify(all));
     } catch (err) {
       console.log('[upbit/klines] FAILED:', market, err.message);
       res.writeHead(err.statusCode === 404 ? 404 : 502, { 'Content-Type': 'application/json' });
