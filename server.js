@@ -471,7 +471,7 @@ const server = http.createServer(async (req, res) => {
   if (reqUrl.pathname === '/upbit/klines') {
     const market = (reqUrl.searchParams.get('market') || 'KRW-BTC').toUpperCase();
     const unit = reqUrl.searchParams.get('unit') || 'days';
-    const count = Math.min(parseInt(reqUrl.searchParams.get('count') || '200', 10), 3000); // 최대 3000개 (200개씩 최대 15페이지)
+    const count = Math.min(parseInt(reqUrl.searchParams.get('count') || '200', 10), 600); // 최대 600개(3페이지)로 제한 - 속도 우선
     try {
       function buildUrl(pageCount, to) {
         let base;
@@ -492,7 +492,7 @@ const server = http.createServer(async (req, res) => {
         all = all.concat(batch); // 업비트는 최신순(내림차순)으로 줌
         to = batch[batch.length - 1].candle_date_time_utc;
         if (batch.length < pageCount) break; // 더 이상 과거 데이터 없음
-        if (all.length < count) await sleep(200); // 페이지 사이 살짝 텀
+        if (all.length < count) await sleep(100); // 페이지 사이 살짝 텀
       }
 
       res.setHeader('Cache-Control', 'no-store');
