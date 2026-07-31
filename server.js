@@ -28,6 +28,8 @@ let lastSuccessAt = null;
 let latestTickers = []; // 최신 24hr 티커 스냅샷 (스크리너가 상위 10개 뽑는 데 씀)
 let upbitMarketsCache = null;
 let upbitMarketsCacheAt = 0;
+let symbolTypeCache = null; // { SYMBOL: { underlyingType, underlyingSubType } } - COIN이 아닌 것만 저장
+let symbolTypeCacheAt = 0;
 let lastScreenerResult = null;
 let screenerRunning = false;
 let binanceBannedUntil = 0; // 바이낸스 IP 차단 해제 예정 시각 (서버 전체가 공유)
@@ -396,6 +398,33 @@ const server = http.createServer(async (req, res) => {
   } catch (e) {
     res.writeHead(400);
     res.end('bad url');
+    return;
+  }
+
+  // 심볼 분류(코인 vs TradFi 주식/ETF 등) - exchangeInfo의 underlyingType/underlyingSubType 활용
+  // 자주 안 바뀌니 1시간 캐싱
+  if (reqUrl.pathname === '/binance/symbolTypes') {
+    try {
+      const now = Date.now();
+      if (!symbolTypeCache || now - symbolTypeCacheAt > 3600000) {
+        const info = await httpsGetJsonBinance('https://fapi.binance.com/fapi/v1/exchangeInfo', 12000);
+        const map = {};
+        for (const s of info.symbols || []) {
+          if (s.underlyingType && s.underlyingType !== 'COIN') {
+            map[s.symbol] = { underlyingType: s.underlyingType, underlyingSubType: s.underlyingSubType || [] };
+          }
+        }
+        symbolTypeCache = map;
+        symbolTypeCacheAt = now;
+        console.log(`[symbolTypes] 캐시 갱신, COIN 아닌 심볼 ${Object.keys(map).length}개`);
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(symbolTypeCache));
+    } catch (err) {
+      console.log('[symbolTypes] FAILED:', err.message);
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
     return;
   }
 
