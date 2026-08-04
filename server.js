@@ -243,7 +243,7 @@ async function fetchUpbitTop5() {
     .slice(0, 5);
 }
 
-async function runScreenerJob(forcedHours) {
+async function runScreenerJob(forcedHours, triggeredBy = 'manual') {
   if (screenerRunning) {
     console.log('[screener] already running, skip this trigger');
     return;
@@ -357,6 +357,7 @@ async function runScreenerJob(forcedHours) {
       time: Date.now(),
       scanned: [...top10.map((t) => t.s), ...upbitTop5.map((u) => u.market)],
       hours,
+      triggeredBy,
       results: dedupedResults,
     };
 
@@ -384,7 +385,7 @@ setInterval(() => {
   if (m === 58 && TARGET_KST_HOURS.has(h) && lastScreenerRunKey !== key) {
     lastScreenerRunKey = key;
     console.log(`[screener] scheduled trigger at KST ${h}:${m}`);
-    runScreenerJob(RUN_HOUR_TO_TIMEFRAME[h]).catch((e) => console.log('[screener] job error:', e.message));
+    runScreenerJob(RUN_HOUR_TO_TIMEFRAME[h], 'schedule').catch((e) => console.log('[screener] job error:', e.message));
   }
 }, 15000);
 
