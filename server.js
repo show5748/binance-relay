@@ -188,7 +188,7 @@ async function pollLoop() {
   setTimeout(pollLoop, nextDelay);
 }
 
-const DEVIATION_THRESHOLD_PCT = 0.6;
+const TF_THRESHOLD_PCT = { 80: 0.6, 100: 0.7 }; // 시간봉(분)별 이격률 임계값
 const BTC_BASE_INTERVAL = '5m'; // 80분/100분 둘 다 5분 단위로 정확히 나눠떨어짐 (80/5=16, 100/5=20)
 const BTC_BASE_LIMIT = 300; // 5분봉 300개 = 25시간, MA5 계산에 충분한 여유
 
@@ -245,7 +245,8 @@ async function runScreenerJob(timeframesMinutes, triggeredBy = 'manual') {
         const price = aggClose[aggClose.length - 1];
         const deviationPct = ((price - ma5) / ma5) * 100;
 
-        if (Math.abs(deviationPct) >= DEVIATION_THRESHOLD_PCT) {
+        const threshold = TF_THRESHOLD_PCT[tfMin] ?? 0.6;
+        if (Math.abs(deviationPct) >= threshold) {
           results.push({
             exchange: 'binance',
             symbol: 'BTCUSDT',
@@ -253,6 +254,7 @@ async function runScreenerJob(timeframesMinutes, triggeredBy = 'manual') {
             price,
             ma5,
             deviationPct,
+            threshold,
             change24h,
           });
         }
