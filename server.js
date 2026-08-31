@@ -188,9 +188,9 @@ async function pollLoop() {
   setTimeout(pollLoop, nextDelay);
 }
 
-const TF_THRESHOLD_PCT = { 80: 0.6, 100: 0.7 }; // 시간봉(분)별 이격률 임계값
+const TF_THRESHOLD_PCT = { 80: 0.6, 100: 0.7 }; // 시간봉(분)별 MA5 이격률 임계값
 const BTC_BASE_INTERVAL = '5m'; // 80분/100분 둘 다 5분 단위로 정확히 나눠떨어짐 (80/5=16, 100/5=20)
-const BTC_BASE_LIMIT = 300; // 5분봉 300개 = 25시간, MA5 계산에 충분한 여유
+const BTC_BASE_LIMIT = 1000; // 5분봉 1000개 = 약 3.5일치 - RSI14 계산에 충분한 여유
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -214,6 +214,30 @@ function maLast(values, period) {
   if (values.length < period) return null;
   const slice = values.slice(values.length - period);
   return slice.reduce((a, b) => a + b, 0) / period;
+}
+
+// 종가 배열로 볼린저밴드(중심선 ± N*표준편차) 계산 - 가장 최근 시점 기준 값 하나만 반환
+function computeBollinger(closes, period = 20, mult = 2) {
+  if (closes.length < period) return null;
+  const slice = closes.slice(closes.length - period);
+  const mean = slice.reduce((a, b) => a + b, 0) / period;
+  const variance = slice.reduce((a, b) => a + (b - mean) ** 2, 0) / period;
+  const stdDev = Math.sqrt(variance);
+  return { mid: mean, upper: mean + mult * stdDev, lower: mean - mult * stdDev };
+}
+
+// 5분봉 원본(klines) 배열에서, 가장 최근 groupSize개를 묶어 합성한 "가장 최근 캔들 하나"의 OHLC를 계산
+function lastAggregatedOHLC(klines, groupSize) {
+  const group = klines.slice(-groupSize);
+  if (group.length === 0) return null;
+  const open = parseFloat(group[0][1]);
+  const close = parseFloat(group[group.length - 1][4]);
+  let high = -Infinity, low = Infinity;
+  for (const k of group) {
+    high = Math.max(high, parseFloat(k[2]));
+    low = Math.min(low, parseFloat(k[3]));
+  }
+  return { open, high, low, close };
 }
 
 // BTC만, 지정된 시간봉(분 단위, 예: [80, 100])들을 각각 확인해서
@@ -246,7 +270,15 @@ async function runScreenerJob(timeframesMinutes, triggeredBy = 'manual') {
         const deviationPct = ((price - ma5) / ma5) * 100;
 
         const threshold = TF_THRESHOLD_PCT[tfMin] ?? 0.6;
-        if (Math.abs(deviationPct) >= threshold) {
+        const ma5Ok = Math.abs(deviationPct) >= threshold;
+
+        // 볼린저밴드(20, 2) 상단/하단 이탈 조건
+        const bb = computeBollinger(aggClose, 20, 2);
+        const bbOk = bb !== null && (price > bb.upper || price < bb.lower);
+        const bbSide = bb !== null ? (price > bb.upper ? 'upper' : (price < bb.lower ? 'lower' : null)) : null;
+
+        // 두 조건을 다 만족해야 알림 (MA5 이격 AND 볼린저밴드 이탈)
+        if (ma5Ok && bbOk) {
           results.push({
             exchange: 'binance',
             symbol: 'BTCUSDT',
@@ -255,6 +287,8 @@ async function runScreenerJob(timeframesMinutes, triggeredBy = 'manual') {
             ma5,
             deviationPct,
             threshold,
+            bb,
+            bbSide,
             change24h,
           });
         }
