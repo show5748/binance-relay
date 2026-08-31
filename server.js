@@ -318,6 +318,29 @@ setInterval(() => {
   }
 }, 15000);
 
+// 4분할 차트 뷰 스케줄 - 이격률 조건 없이, 정해진 시각에 그냥 지정된 4개 시간봉을 보여주기용으로 신호만 보냄
+const QUAD_VIEW_SCHEDULE = {
+  '21:00': [720, 360, 240, 180], // 21시 -> 12h, 6h, 4h, 3h
+};
+let lastQuadViewKey = null;
+
+setInterval(() => {
+  const kst = new Date(Date.now() + 9 * 3600 * 1000);
+  const h = kst.getUTCHours();
+  const mi = kst.getUTCMinutes();
+  const timeKey = `${String(h).padStart(2, '0')}:${String(mi).padStart(2, '0')}`;
+  const dateKey = `${kst.getUTCFullYear()}-${kst.getUTCMonth()}-${kst.getUTCDate()}-${timeKey}`;
+  if (QUAD_VIEW_SCHEDULE[timeKey] && lastQuadViewKey !== dateKey) {
+    lastQuadViewKey = dateKey;
+    const timeframesMin = QUAD_VIEW_SCHEDULE[timeKey];
+    console.log(`[quadView] scheduled trigger at KST ${timeKey}, tf=${timeframesMin.join(',')}min`);
+    const msg = JSON.stringify({ type: 'quad_view_trigger', time: Date.now(), symbol: 'BTCUSDT', timeframesMin });
+    for (const client of clients) {
+      if (client.readyState === WebSocket.OPEN) client.send(msg);
+    }
+  }
+}, 15000);
+
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET');
