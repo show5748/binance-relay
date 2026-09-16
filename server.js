@@ -188,21 +188,27 @@ async function pollLoop() {
   setTimeout(pollLoop, nextDelay);
 }
 
-const TF_THRESHOLD_PCT = { 80: 0.6, 100: 0.7 }; // 시간봉(분)별 MA5 이격률 임계값
-const BTC_BASE_INTERVAL = '5m'; // 80분/100분 둘 다 5분 단위로 정확히 나눠떨어짐 (80/5=16, 100/5=20)
-const BTC_BASE_LIMIT = 1000; // 5분봉 1000개 = 약 3.5일치 - RSI14 계산에 충분한 여유
+const DEVIATION_THRESHOLD_PCT = 10;
+const BASE_KLINE_LIMIT = 500; // 1시간봉 500개 (20.8일치) - 20시간봉에서도 MA5 계산에 충분한 여유
+
+// 실행 시각(KST, N:58)에 어떤 시간봉을 확인할지 매핑
+// 15:58(16시 대응)->7h, 16:58(17시)->8h, ... 6:58(07시)->22h
+const RUN_HOUR_TO_TIMEFRAME = {
+  15: 7, 16: 8, 17: 9, 18: 10, 19: 11, 20: 12, 21: 13, 22: 14,
+  23: 15, 0: 16, 1: 17, 2: 18, 3: 19, 4: 20, 5: 21, 6: 22,
+};
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// 5분봉 종가 배열을, 가장 최근 캔들 기준으로 뒤에서부터 groupSize개씩 묶어서
+// 1시간봉 종가 배열을, 가장 최근 캔들 기준으로 뒤에서부터 hours개씩 묶어서
 // 합성 종가 배열을 만든다 (자체차트와 동일한 방식, MA 계산용으로는 종가만 있으면 충분)
-function aggregateClosesBackward(closes, groupSize) {
+function aggregateClosesBackward(closes, hours) {
   const out = [];
   let end = closes.length;
   while (end > 0) {
-    const start = Math.max(0, end - groupSize);
+    const start = Math.max(0, end - hours);
     out.push(closes[end - 1]); // 이 구간의 마지막 종가
     end = start;
   }
@@ -216,96 +222,146 @@ function maLast(values, period) {
   return slice.reduce((a, b) => a + b, 0) / period;
 }
 
-// 종가 배열로 볼린저밴드(중심선 ± N*표준편차) 계산 - 가장 최근 시점 기준 값 하나만 반환
-function computeBollinger(closes, period = 20, mult = 2) {
-  if (closes.length < period) return null;
-  const slice = closes.slice(closes.length - period);
-  const mean = slice.reduce((a, b) => a + b, 0) / period;
-  const variance = slice.reduce((a, b) => a + (b - mean) ** 2, 0) / period;
-  const stdDev = Math.sqrt(variance);
-  return { mid: mean, upper: mean + mult * stdDev, lower: mean - mult * stdDev };
-}
-
-// 5분봉 원본(klines) 배열에서, 가장 최근 groupSize개를 묶어 합성한 "가장 최근 캔들 하나"의 OHLC를 계산
-function lastAggregatedOHLC(klines, groupSize) {
-  const group = klines.slice(-groupSize);
-  if (group.length === 0) return null;
-  const open = parseFloat(group[0][1]);
-  const close = parseFloat(group[group.length - 1][4]);
-  let high = -Infinity, low = Infinity;
-  for (const k of group) {
-    high = Math.max(high, parseFloat(k[2]));
-    low = Math.min(low, parseFloat(k[3]));
+// 업비트 KRW 마켓 상위 5개(24h 변동률 기준) 조회 - 이격 스크리너용
+async function fetchUpbitTop5() {
+  const now = Date.now();
+  if (!upbitMarketsCache || now - upbitMarketsCacheAt > 3600000) {
+    const all = await httpsGetJson('https://api.upbit.com/v1/market/all?isDetails=false', 10000, { 'User-Agent': 'Mozilla/5.0' });
+    upbitMarketsCache = all
+      .filter((m) => m.market.startsWith('KRW-'))
+      .map((m) => ({ market: m.market, koreanName: m.korean_name }));
+    upbitMarketsCacheAt = now;
   }
-  return { open, high, low, close };
+  const nameByMarket = new Map(upbitMarketsCache.map((m) => [m.market, m.koreanName]));
+  const marketList = upbitMarketsCache.map((m) => m.market).join(',');
+  const data = await httpsGetJson(`https://api.upbit.com/v1/ticker?markets=${marketList}`, 10000, { 'User-Agent': 'Mozilla/5.0' });
+  return data
+    .map((t) => ({ market: t.market, koreanName: nameByMarket.get(t.market) || '', changePct24h: t.signed_change_rate * 100 }))
+    .sort((a, b) => b.changePct24h - a.changePct24h)
+    .slice(0, 5);
 }
 
-// BTC만, 지정된 시간봉(분 단위, 예: [80, 100])들을 각각 확인해서
-// 현재가가 MA5 대비 ±0.6% 이상 이격되면 기록하는 스크리너
-async function runScreenerJob(timeframesMinutes, triggeredBy = 'manual') {
+// 상위 10개(24h 변동률 기준) 각각을, 그 시각에 매핑된 시간봉 "딱 하나"로만 확인해서
+// 현재가가 MA5 대비 ±10% 이상 이격되면 기록하는 스크리너 (바이낸스 상위10 + 업비트 상위5)
+async function runScreenerJob(forcedHours, triggeredBy = 'manual') {
   if (screenerRunning) {
     console.log('[screener] already running, skip this trigger');
+    return;
+  }
+  if (!latestTickers.length) {
+    console.log('[screener] skip: no ticker snapshot yet');
     return;
   }
   screenerRunning = true;
   const startedAt = Date.now();
   try {
-    const tfList = timeframesMinutes && timeframesMinutes.length ? timeframesMinutes : [80, 100];
-    const results = [];
-    try {
-      const kl = await httpsGetJsonBinance(
-        `https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT&interval=${BTC_BASE_INTERVAL}&limit=${BTC_BASE_LIMIT}`,
-        10000
-      );
-      const closes = kl.map((k) => parseFloat(k[4]));
-      const btcTicker = latestTickers.find((t) => t.s === 'BTCUSDT');
-      const change24h = btcTicker ? parseFloat(btcTicker.P) : null;
+    // 이번 실행에서 확인할 시간봉 하나 결정: 수동 호출시 forcedHours, 아니면 현재 KST 시각으로 매핑
+    let hours = forcedHours;
+    if (!hours) {
+      const kst = new Date(Date.now() + 9 * 3600 * 1000);
+      hours = RUN_HOUR_TO_TIMEFRAME[kst.getUTCHours()] || 8; // 스케줄 범위 밖이면 8h로 기본 테스트
+    }
 
-      for (const tfMin of tfList) {
-        const groupSize = Math.round(tfMin / 5);
-        const aggClose = aggregateClosesBackward(closes, groupSize);
+    const top10 = [...latestTickers]
+      .sort((a, b) => parseFloat(b.P) - parseFloat(a.P))
+      .slice(0, 10);
+
+    const results = [];
+    for (const t of top10) {
+      try {
+        const kl = await httpsGetJsonBinance(
+          `https://fapi.binance.com/fapi/v1/klines?symbol=${encodeURIComponent(t.s)}&interval=1h&limit=${BASE_KLINE_LIMIT}`,
+          10000
+        );
+        const closes = kl.map((k) => parseFloat(k[4]));
+
+        const aggClose = aggregateClosesBackward(closes, hours);
         const ma5 = maLast(aggClose, 5);
         if (ma5 === null) continue; // 데이터 부족
         const price = aggClose[aggClose.length - 1];
         const deviationPct = ((price - ma5) / ma5) * 100;
 
-        const threshold = TF_THRESHOLD_PCT[tfMin] ?? 0.6;
-        const ma5Ok = Math.abs(deviationPct) >= threshold;
-
-        // 볼린저밴드(20, 2) 상단/하단 이탈 조건
-        const bb = computeBollinger(aggClose, 20, 2);
-        const bbOk = bb !== null && (price > bb.upper || price < bb.lower);
-        const bbSide = bb !== null ? (price > bb.upper ? 'upper' : (price < bb.lower ? 'lower' : null)) : null;
-
-        // 두 조건을 다 만족해야 알림 (MA5 이격 AND 볼린저밴드 이탈)
-        if (ma5Ok && bbOk) {
+        if (Math.abs(deviationPct) >= DEVIATION_THRESHOLD_PCT) {
           results.push({
             exchange: 'binance',
-            symbol: 'BTCUSDT',
-            tfMinutes: tfMin,
+            symbol: t.s,
+            hours,
             price,
             ma5,
             deviationPct,
-            threshold,
-            bb,
-            bbSide,
-            change24h,
+            change24h: parseFloat(t.P),
           });
         }
+      } catch (err) {
+        console.log('[screener] symbol error', t.s, err.message);
+        if (err.isBanSkip) {
+          console.log('[screener] 바이낸스 차단 중이라 나머지 심볼은 건너뜀');
+          break;
+        }
       }
-    } catch (err) {
-      console.log('[screener] BTC 조회 실패:', err.message);
+      await sleep(300); // 심볼 사이 살짝 텀 (레이트리밋 여유, 10개면 총 3초 정도)
     }
+
+    // 업비트 상위 5개(24h 변동률 기준)도 같은 방식으로 확인
+    const upbitTop5 = await fetchUpbitTop5().catch((err) => {
+      console.log('[screener] 업비트 상위5 조회 실패:', err.message);
+      return [];
+    });
+    for (const u of upbitTop5) {
+      try {
+        const kl = await httpsGetJson(
+          `https://api.upbit.com/v1/candles/minutes/60?market=${encodeURIComponent(u.market)}&count=200`,
+          10000,
+          { 'User-Agent': 'Mozilla/5.0' }
+        );
+        const closes = kl.map((c) => c.trade_price).reverse(); // 업비트는 최신순 -> 오름차순으로
+
+        const aggClose = aggregateClosesBackward(closes, hours);
+        const ma5 = maLast(aggClose, 5);
+        if (ma5 === null) continue;
+        const price = aggClose[aggClose.length - 1];
+        const deviationPct = ((price - ma5) / ma5) * 100;
+
+        if (Math.abs(deviationPct) >= DEVIATION_THRESHOLD_PCT) {
+          results.push({
+            exchange: 'upbit',
+            symbol: u.market,
+            koreanName: u.koreanName,
+            hours,
+            price,
+            ma5,
+            deviationPct,
+            change24h: u.changePct24h,
+          });
+        }
+      } catch (err) {
+        console.log('[screener] 업비트 심볼 에러', u.market, err.message);
+      }
+      await sleep(250);
+    }
+
+    // 같은 코인이 양쪽에 다 걸리면 바이낸스 쪽을 우선하고 업비트 중복은 제거
+    // (안 겹치는 업비트 항목은 한글 이름이 붙어있어서 "업비트에만 상장된 코인"임이 자연스럽게 드러남)
+    const baseAssetOf = (r) => r.exchange === 'binance' ? r.symbol.replace(/USDT$/, '') : r.symbol.replace(/^KRW-/, '');
+    const dedupedByBase = new Map();
+    for (const r of results) {
+      const base = baseAssetOf(r);
+      const existing = dedupedByBase.get(base);
+      if (!existing || (existing.exchange === 'upbit' && r.exchange === 'binance')) {
+        dedupedByBase.set(base, r);
+      }
+    }
+    const dedupedResults = Array.from(dedupedByBase.values());
 
     lastScreenerResult = {
       time: Date.now(),
-      scanned: ['BTCUSDT'],
-      tfList,
+      scanned: [...top10.map((t) => t.s), ...upbitTop5.map((u) => u.market)],
+      hours,
       triggeredBy,
-      results,
+      results: dedupedResults,
     };
 
-    console.log(`[screener] scan complete in ${Date.now()-startedAt}ms, tf=${tfList.join(',')}min, matched=${results.length}`);
+    console.log(`[screener] scan complete in ${Date.now()-startedAt}ms, hours=${hours}h, matched=${dedupedResults.length} (원본 ${results.length}건 중 중복제거)`);
 
     const msg = JSON.stringify({ type: 'screener_result', ...lastScreenerResult });
     for (const client of clients) {
@@ -317,61 +373,19 @@ async function runScreenerJob(timeframesMinutes, triggeredBy = 'manual') {
   return lastScreenerResult;
 }
 
-// BTC 80분봉/100분봉 커스텀 스케줄 - 각 항목은 "그 시각에 캔들이 마감된다"는 뜻이라
-// 실제 체크는 1분 전에 함 (예: 07:40 마감 -> 07:39에 체크)
-const BTC_SCHEDULE = [
-  { time: '07:40', tf: 80 }, { time: '10:20', tf: 80 }, { time: '11:40', tf: 80 },
-  { time: '13:00', tf: 80 }, { time: '14:20', tf: 80 }, { time: '15:40', tf: 80 },
-  { time: '08:20', tf: 100 }, { time: '10:40', tf: 100 }, { time: '12:20', tf: 100 },
-  { time: '14:00', tf: 100 }, { time: '15:40', tf: 100 },
-];
-// "HH:MM"(체크 시각) -> [tf, tf, ...] 맵으로 미리 변환
-const RUN_SCHEDULE = {};
-for (const { time, tf } of BTC_SCHEDULE) {
-  const [h, mi] = time.split(':').map(Number);
-  let rh = h, rmi = mi - 1;
-  if (rmi < 0) { rmi = 59; rh = (h - 1 + 24) % 24; }
-  const key = `${String(rh).padStart(2, '0')}:${String(rmi).padStart(2, '0')}`;
-  if (!RUN_SCHEDULE[key]) RUN_SCHEDULE[key] = [];
-  RUN_SCHEDULE[key].push(tf);
-}
-console.log('[screener] BTC 체크 스케줄(KST, 마감 1분 전):', RUN_SCHEDULE);
-
+// 한국시간(KST, UTC+9) 기준 매시 58분에 실행 (15시~07시 구간을 2분 전에 커버하는 스케줄)
+const TARGET_KST_HOURS = new Set([15, 16, 17, 18, 19, 20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6]);
 let lastScreenerRunKey = null;
 
 setInterval(() => {
   const kst = new Date(Date.now() + 9 * 3600 * 1000); // UTC+9 KST는 DST 없음
   const h = kst.getUTCHours();
-  const mi = kst.getUTCMinutes();
-  const timeKey = `${String(h).padStart(2, '0')}:${String(mi).padStart(2, '0')}`;
-  const dateKey = `${kst.getUTCFullYear()}-${kst.getUTCMonth()}-${kst.getUTCDate()}-${timeKey}`;
-  if (RUN_SCHEDULE[timeKey] && lastScreenerRunKey !== dateKey) {
-    lastScreenerRunKey = dateKey;
-    console.log(`[screener] scheduled trigger at KST ${timeKey}, tf=${RUN_SCHEDULE[timeKey].join(',')}min`);
-    runScreenerJob(RUN_SCHEDULE[timeKey], 'schedule').catch((e) => console.log('[screener] job error:', e.message));
-  }
-}, 15000);
-
-// 4분할 차트 뷰 스케줄 - 이격률 조건 없이, 정해진 시각에 그냥 지정된 4개 시간봉을 보여주기용으로 신호만 보냄
-const QUAD_VIEW_SCHEDULE = {
-  '21:00': [720, 360, 240, 180], // 21시 -> 12h, 6h, 4h, 3h
-};
-let lastQuadViewKey = null;
-
-setInterval(() => {
-  const kst = new Date(Date.now() + 9 * 3600 * 1000);
-  const h = kst.getUTCHours();
-  const mi = kst.getUTCMinutes();
-  const timeKey = `${String(h).padStart(2, '0')}:${String(mi).padStart(2, '0')}`;
-  const dateKey = `${kst.getUTCFullYear()}-${kst.getUTCMonth()}-${kst.getUTCDate()}-${timeKey}`;
-  if (QUAD_VIEW_SCHEDULE[timeKey] && lastQuadViewKey !== dateKey) {
-    lastQuadViewKey = dateKey;
-    const timeframesMin = QUAD_VIEW_SCHEDULE[timeKey];
-    console.log(`[quadView] scheduled trigger at KST ${timeKey}, tf=${timeframesMin.join(',')}min`);
-    const msg = JSON.stringify({ type: 'quad_view_trigger', time: Date.now(), symbol: 'BTCUSDT', timeframesMin });
-    for (const client of clients) {
-      if (client.readyState === WebSocket.OPEN) client.send(msg);
-    }
+  const m = kst.getUTCMinutes();
+  const key = `${kst.getUTCFullYear()}-${kst.getUTCMonth()}-${kst.getUTCDate()}-${h}`;
+  if (m === 58 && TARGET_KST_HOURS.has(h) && lastScreenerRunKey !== key) {
+    lastScreenerRunKey = key;
+    console.log(`[screener] scheduled trigger at KST ${h}:${m}`);
+    runScreenerJob(RUN_HOUR_TO_TIMEFRAME[h], 'schedule').catch((e) => console.log('[screener] job error:', e.message));
   }
 }, 15000);
 
@@ -799,9 +813,9 @@ const server = http.createServer(async (req, res) => {
   // 이격도 스크리너: 수동 즉시 실행 (테스트용)
   if (reqUrl.pathname === '/screener/run') {
     try {
-      const tfParam = reqUrl.searchParams.get('tf'); // 예: "80,100"
-      const tfList = tfParam ? tfParam.split(',').map((s) => parseInt(s, 10)).filter(Boolean) : undefined;
-      const result = await runScreenerJob(tfList);
+      const hoursParam = reqUrl.searchParams.get('hours');
+      const forcedHours = hoursParam ? parseInt(hoursParam, 10) : undefined;
+      const result = await runScreenerJob(forcedHours);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(result || { skipped: true }));
     } catch (err) {
