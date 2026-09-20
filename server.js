@@ -189,26 +189,46 @@ async function pollLoop() {
 }
 
 const DEVIATION_THRESHOLD_PCT = 10;
-const BASE_KLINE_LIMIT = 500; // 1시간봉 500개 (20.8일치) - 20시간봉에서도 MA5 계산에 충분한 여유
-
-// 실행 시각(KST, N:58)에 어떤 시간봉을 확인할지 매핑
-// 15:58(16시 대응)->7h, 16:58(17시)->8h, ... 6:58(07시)->22h
-const RUN_HOUR_TO_TIMEFRAME = {
-  15: 7, 16: 8, 17: 9, 18: 10, 19: 11, 20: 12, 21: 13, 22: 14,
-  23: 15, 0: 16, 1: 17, 2: 18, 3: 19, 4: 20, 5: 21, 6: 22,
-};
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// 1시간봉 종가 배열을, 가장 최근 캔들 기준으로 뒤에서부터 hours개씩 묶어서
+// 목표 분(tfMin)에 딱 떨어지는 것 중 가장 큰 바이낸스 기본봉을 고름
+// (예: 40분 -> 1분봉 40개 대신 5분봉 8개로 - 같은 원본 데이터량으로 훨씬 효율적)
+const BINANCE_BASE_CANDIDATES_DESC = [
+  { interval: '1d', min: 1440 }, { interval: '12h', min: 720 }, { interval: '8h', min: 480 },
+  { interval: '6h', min: 360 }, { interval: '4h', min: 240 }, { interval: '2h', min: 120 },
+  { interval: '1h', min: 60 }, { interval: '30m', min: 30 }, { interval: '15m', min: 15 },
+  { interval: '5m', min: 5 }, { interval: '3m', min: 3 }, { interval: '1m', min: 1 },
+];
+function chooseBinanceBase(tfMin) {
+  for (const c of BINANCE_BASE_CANDIDATES_DESC) {
+    if (c.min < tfMin && tfMin % c.min === 0) return c;
+  }
+  return { interval: '1m', min: 1 };
+}
+
+// 업비트도 같은 방식 (업비트가 지원하는 분단위: 1,3,5,10,15,30,60,240)
+const UPBIT_BASE_CANDIDATES_DESC = [
+  { unit: '240', min: 240 }, { unit: '60', min: 60 }, { unit: '30', min: 30 },
+  { unit: '15', min: 15 }, { unit: '10', min: 10 }, { unit: '5', min: 5 },
+  { unit: '3', min: 3 }, { unit: '1', min: 1 },
+];
+function chooseUpbitBase(tfMin) {
+  for (const c of UPBIT_BASE_CANDIDATES_DESC) {
+    if (c.min < tfMin && tfMin % c.min === 0) return c;
+  }
+  return { unit: '1', min: 1 };
+}
+
+// 종가 배열을, 가장 최근 캔들 기준으로 뒤에서부터 groupSize개씩 묶어서
 // 합성 종가 배열을 만든다 (자체차트와 동일한 방식, MA 계산용으로는 종가만 있으면 충분)
-function aggregateClosesBackward(closes, hours) {
+function aggregateClosesBackward(closes, groupSize) {
   const out = [];
   let end = closes.length;
   while (end > 0) {
-    const start = Math.max(0, end - hours);
+    const start = Math.max(0, end - groupSize);
     out.push(closes[end - 1]); // 이 구간의 마지막 종가
     end = start;
   }
@@ -241,9 +261,9 @@ async function fetchUpbitTop5() {
     .slice(0, 5);
 }
 
-// 상위 10개(24h 변동률 기준) 각각을, 그 시각에 매핑된 시간봉 "딱 하나"로만 확인해서
-// 현재가가 MA5 대비 ±10% 이상 이격되면 기록하는 스크리너 (바이낸스 상위10 + 업비트 상위5)
-async function runScreenerJob(forcedHours, triggeredBy = 'manual') {
+// 상위 10개(바이낸스) + 상위5개(업비트)를, 그 시각에 지정된 분단위 시간봉 "딱 하나"로 확인해서
+// 현재가가 MA5 대비 ±10% 이상 이격되면 기록하는 스크리너
+async function runScreenerJob(forcedTfMin, triggeredBy = 'manual') {
   if (screenerRunning) {
     console.log('[screener] already running, skip this trigger');
     return;
@@ -255,29 +275,28 @@ async function runScreenerJob(forcedHours, triggeredBy = 'manual') {
   screenerRunning = true;
   const startedAt = Date.now();
   try {
-    // 이번 실행에서 확인할 시간봉 하나 결정: 수동 호출시 forcedHours, 아니면 현재 KST 시각으로 매핑
-    let hours = forcedHours;
-    if (!hours) {
-      const kst = new Date(Date.now() + 9 * 3600 * 1000);
-      hours = RUN_HOUR_TO_TIMEFRAME[kst.getUTCHours()] || 8; // 스케줄 범위 밖이면 8h로 기본 테스트
-    }
+    const tfMin = forcedTfMin || 60; // 수동 호출인데 지정 안 하면 기본 60분으로 테스트
 
     const top10 = [...latestTickers]
       .sort((a, b) => parseFloat(b.P) - parseFloat(a.P))
       .slice(0, 10);
 
     const results = [];
+    const binanceBase = chooseBinanceBase(tfMin);
+    const binGroupSize = tfMin / binanceBase.min;
+    const binLimit = Math.min(binGroupSize * 6 + 10, 1500); // MA5 계산에 여유있게, 최대 1500(바이낸스 1회 요청 한도)
+
     for (const t of top10) {
       try {
         const kl = await httpsGetJsonBinance(
-          `https://fapi.binance.com/fapi/v1/klines?symbol=${encodeURIComponent(t.s)}&interval=1h&limit=${BASE_KLINE_LIMIT}`,
+          `https://fapi.binance.com/fapi/v1/klines?symbol=${encodeURIComponent(t.s)}&interval=${binanceBase.interval}&limit=${binLimit}`,
           10000
         );
         const closes = kl.map((k) => parseFloat(k[4]));
 
-        const aggClose = aggregateClosesBackward(closes, hours);
+        const aggClose = aggregateClosesBackward(closes, binGroupSize);
         const ma5 = maLast(aggClose, 5);
-        if (ma5 === null) continue; // 데이터 부족
+        if (ma5 === null) continue; // 데이터 부족 (극단적으로 큰 시간봉이면 1500개로도 5개를 못 채울 수 있음)
         const price = aggClose[aggClose.length - 1];
         const deviationPct = ((price - ma5) / ma5) * 100;
 
@@ -285,7 +304,7 @@ async function runScreenerJob(forcedHours, triggeredBy = 'manual') {
           results.push({
             exchange: 'binance',
             symbol: t.s,
-            hours,
+            tfMinutes: tfMin,
             price,
             ma5,
             deviationPct,
@@ -299,7 +318,7 @@ async function runScreenerJob(forcedHours, triggeredBy = 'manual') {
           break;
         }
       }
-      await sleep(300); // 심볼 사이 살짝 텀 (레이트리밋 여유, 10개면 총 3초 정도)
+      await sleep(300); // 심볼 사이 살짝 텀 (레이트리밋 여유)
     }
 
     // 업비트 상위 5개(24h 변동률 기준)도 같은 방식으로 확인
@@ -307,16 +326,20 @@ async function runScreenerJob(forcedHours, triggeredBy = 'manual') {
       console.log('[screener] 업비트 상위5 조회 실패:', err.message);
       return [];
     });
+    const upbitBase = chooseUpbitBase(tfMin);
+    const upbitGroupSize = tfMin / upbitBase.min;
+    const upbitLimit = Math.min(upbitGroupSize * 6 + 10, 200); // 업비트 1회 요청 한도 200
+
     for (const u of upbitTop5) {
       try {
         const kl = await httpsGetJson(
-          `https://api.upbit.com/v1/candles/minutes/60?market=${encodeURIComponent(u.market)}&count=200`,
+          `https://api.upbit.com/v1/candles/minutes/${upbitBase.unit}?market=${encodeURIComponent(u.market)}&count=${upbitLimit}`,
           10000,
           { 'User-Agent': 'Mozilla/5.0' }
         );
         const closes = kl.map((c) => c.trade_price).reverse(); // 업비트는 최신순 -> 오름차순으로
 
-        const aggClose = aggregateClosesBackward(closes, hours);
+        const aggClose = aggregateClosesBackward(closes, upbitGroupSize);
         const ma5 = maLast(aggClose, 5);
         if (ma5 === null) continue;
         const price = aggClose[aggClose.length - 1];
@@ -327,7 +350,7 @@ async function runScreenerJob(forcedHours, triggeredBy = 'manual') {
             exchange: 'upbit',
             symbol: u.market,
             koreanName: u.koreanName,
-            hours,
+            tfMinutes: tfMin,
             price,
             ma5,
             deviationPct,
@@ -341,14 +364,13 @@ async function runScreenerJob(forcedHours, triggeredBy = 'manual') {
     }
 
     // 같은 코인이 양쪽에 다 걸리면 바이낸스 쪽을 우선하고 업비트 중복은 제거
-    // (안 겹치는 업비트 항목은 한글 이름이 붙어있어서 "업비트에만 상장된 코인"임이 자연스럽게 드러남)
     const baseAssetOf = (r) => r.exchange === 'binance' ? r.symbol.replace(/USDT$/, '') : r.symbol.replace(/^KRW-/, '');
     const dedupedByBase = new Map();
     for (const r of results) {
-      const base = baseAssetOf(r);
-      const existing = dedupedByBase.get(base);
+      const baseAsset = baseAssetOf(r);
+      const existing = dedupedByBase.get(baseAsset);
       if (!existing || (existing.exchange === 'upbit' && r.exchange === 'binance')) {
-        dedupedByBase.set(base, r);
+        dedupedByBase.set(baseAsset, r);
       }
     }
     const dedupedResults = Array.from(dedupedByBase.values());
@@ -356,12 +378,12 @@ async function runScreenerJob(forcedHours, triggeredBy = 'manual') {
     lastScreenerResult = {
       time: Date.now(),
       scanned: [...top10.map((t) => t.s), ...upbitTop5.map((u) => u.market)],
-      hours,
+      tfMinutes: tfMin,
       triggeredBy,
       results: dedupedResults,
     };
 
-    console.log(`[screener] scan complete in ${Date.now()-startedAt}ms, hours=${hours}h, matched=${dedupedResults.length} (원본 ${results.length}건 중 중복제거)`);
+    console.log(`[screener] scan complete in ${Date.now()-startedAt}ms, tf=${tfMin}min, matched=${dedupedResults.length} (원본 ${results.length}건 중 중복제거)`);
 
     const msg = JSON.stringify({ type: 'screener_result', ...lastScreenerResult });
     for (const client of clients) {
@@ -373,19 +395,271 @@ async function runScreenerJob(forcedHours, triggeredBy = 'manual') {
   return lastScreenerResult;
 }
 
-// 한국시간(KST, UTC+9) 기준 매시 58분에 실행 (15시~07시 구간을 2분 전에 커버하는 스케줄)
-const TARGET_KST_HOURS = new Set([15, 16, 17, 18, 19, 20, 21, 22, 23, 0, 1, 2, 3, 4, 5, 6]);
+// 커스텀 스케줄 (242개) - 각 시각에 그 옆의 분단위 시간봉을 그 시각 "그대로" 체크함 (1분 전 아님)
+const CUSTOM_SCHEDULE = [
+  { time: '09:20', tf: 20 },
+  { time: '09:30', tf: 15 },
+  { time: '09:35', tf: 35 },
+  { time: '09:40', tf: 40 },
+  { time: '09:41', tf: 41 },
+  { time: '09:42', tf: 42 },
+  { time: '09:45', tf: 45 },
+  { time: '09:50', tf: 50 },
+  { time: '09:55', tf: 55 },
+  { time: '09:56', tf: 56 },
+  { time: '10:00', tf: 60 },
+  { time: '10:05', tf: 65 },
+  { time: '10:10', tf: 70 },
+  { time: '10:11', tf: 71 },
+  { time: '10:13', tf: 73 },
+  { time: '10:20', tf: 80 },
+  { time: '10:30', tf: 90 },
+  { time: '10:33', tf: 93 },
+  { time: '10:34', tf: 94 },
+  { time: '10:35', tf: 95 },
+  { time: '10:36', tf: 96 },
+  { time: '10:39', tf: 99 },
+  { time: '10:40', tf: 100 },
+  { time: '10:50', tf: 110 },
+  { time: '10:52', tf: 56 },
+  { time: '11:00', tf: 120 },
+  { time: '11:05', tf: 125 },
+  { time: '11:10', tf: 65 },
+  { time: '11:14', tf: 134 },
+  { time: '11:20', tf: 140 },
+  { time: '11:24', tf: 72 },
+  { time: '11:30', tf: 30 },
+  { time: '11:40', tf: 40 },
+  { time: '11:42', tf: 54 },
+  { time: '11:43', tf: 163 },
+  { time: '11:50', tf: 85 },
+  { time: '12:00', tf: 180 },
+  { time: '12:02', tf: 182 },
+  { time: '12:03', tf: 183 },
+  { time: '12:05', tf: 185 },
+  { time: '12:06', tf: 186 },
+  { time: '12:10', tf: 190 },
+  { time: '12:15', tf: 195 },
+  { time: '12:20', tf: 200 },
+  { time: '12:30', tf: 210 },
+  { time: '12:40', tf: 220 },
+  { time: '12:50', tf: 230 },
+  { time: '12:55', tf: 235 },
+  { time: '13:00', tf: 48 },
+  { time: '13:20', tf: 52 },
+  { time: '13:30', tf: 54 },
+  { time: '13:35', tf: 55 },
+  { time: '13:40', tf: 56 },
+  { time: '13:50', tf: 58 },
+  { time: '13:55', tf: 59 },
+  { time: '14:00', tf: 60 },
+  { time: '14:10', tf: 62 },
+  { time: '14:16', tf: 158 },
+  { time: '14:20', tf: 64 },
+  { time: '14:28', tf: 41 },
+  { time: '14:30', tf: 66 },
+  { time: '14:36', tf: 112 },
+  { time: '14:40', tf: 68 },
+  { time: '14:45', tf: 69 },
+  { time: '14:50', tf: 70 },
+  { time: '15:00', tf: 72 },
+  { time: '15:10', tf: 74 },
+  { time: '15:20', tf: 76 },
+  { time: '15:25', tf: 55 },
+  { time: '15:39', tf: 57 },
+  { time: '15:40', tf: 80 },
+  { time: '15:45', tf: 81 },
+  { time: '15:54', tf: 69 },
+  { time: '15:50', tf: 82 },
+  { time: '15:56', tf: 208 },
+  { time: '16:00', tf: 84 },
+  { time: '16:10', tf: 86 },
+  { time: '16:15', tf: 87 },
+  { time: '16:18', tf: 146 },
+  { time: '16:20', tf: 88 },
+  { time: '16:30', tf: 90 },
+  { time: '16:40', tf: 92 },
+  { time: '16:42', tf: 77 },
+  { time: '16:45', tf: 93 },
+  { time: '16:50', tf: 94 },
+  { time: '17:00', tf: 96 },
+  { time: '17:10', tf: 98 },
+  { time: '17:20', tf: 100 },
+  { time: '17:24', tf: 84 },
+  { time: '17:25', tf: 101 },
+  { time: '17:27', tf: 39 },
+  { time: '17:30', tf: 102 },
+  { time: '17:38', tf: 14 },
+  { time: '17:40', tf: 104 },
+  { time: '17:45', tf: 105 },
+  { time: '17:50', tf: 106 },
+  { time: '17:55', tf: 107 },
+  { time: '18:00', tf: 108 },
+  { time: '18:10', tf: 110 },
+  { time: '18:20', tf: 112 },
+  { time: '18:25', tf: 113 },
+  { time: '18:30', tf: 114 },
+  { time: '19:00', tf: 120 },
+  { time: '19:10', tf: 122 },
+  { time: '19:20', tf: 124 },
+  { time: '19:21', tf: 69 },
+  { time: '19:30', tf: 126 },
+  { time: '19:35', tf: 127 },
+  { time: '19:40', tf: 128 },
+  { time: '19:50', tf: 130 },
+  { time: '20:00', tf: 132 },
+  { time: '20:10', tf: 134 },
+  { time: '20:15', tf: 135 },
+  { time: '20:20', tf: 136 },
+  { time: '20:30', tf: 138 },
+  { time: '20:40', tf: 140 },
+  { time: '20:45', tf: 141 },
+  { time: '20:50', tf: 142 },
+  { time: '21:00', tf: 144 },
+  { time: '21:05', tf: 145 },
+  { time: '21:10', tf: 146 },
+  { time: '21:15', tf: 147 },
+  { time: '21:20', tf: 148 },
+  { time: '21:30', tf: 150 },
+  { time: '21:40', tf: 152 },
+  { time: '21:45', tf: 153 },
+  { time: '21:50', tf: 154 },
+  { time: '22:00', tf: 156 },
+  { time: '22:04', tf: 112 },
+  { time: '22:10', tf: 158 },
+  { time: '22:15', tf: 159 },
+  { time: '22:20', tf: 160 },
+  { time: '22:30', tf: 162 },
+  { time: '22:35', tf: 163 },
+  { time: '22:40', tf: 164 },
+  { time: '22:45', tf: 165 },
+  { time: '22:50', tf: 166 },
+  { time: '22:55', tf: 167 },
+  { time: '23:00', tf: 168 },
+  { time: '23:05', tf: 169 },
+  { time: '23:10', tf: 170 },
+  { time: '23:15', tf: 171 },
+  { time: '23:20', tf: 172 },
+  { time: '23:25', tf: 173 },
+  { time: '23:28', tf: 62 },
+  { time: '23:30', tf: 174 },
+  { time: '23:35', tf: 175 },
+  { time: '23:40', tf: 176 },
+  { time: '23:45', tf: 177 },
+  { time: '23:50', tf: 178 },
+  { time: '23:52', tf: 223 },
+  { time: '23:55', tf: 179 },
+  { time: '00:00', tf: 180 },
+  { time: '00:10', tf: 182 },
+  { time: '00:15', tf: 183 },
+  { time: '00:20', tf: 184 },
+  { time: '00:25', tf: 185 },
+  { time: '00:30', tf: 186 },
+  { time: '00:38', tf: 134 },
+  { time: '00:40', tf: 188 },
+  { time: '00:50', tf: 190 },
+  { time: '01:00', tf: 192 },
+  { time: '01:10', tf: 194 },
+  { time: '01:15', tf: 195 },
+  { time: '01:20', tf: 196 },
+  { time: '01:25', tf: 197 },
+  { time: '01:29', tf: 43 },
+  { time: '01:30', tf: 198 },
+  { time: '01:40', tf: 200 },
+  { time: '01:43', tf: 59 },
+  { time: '01:45', tf: 201 },
+  { time: '01:50', tf: 202 },
+  { time: '02:00', tf: 204 },
+  { time: '02:10', tf: 206 },
+  { time: '02:20', tf: 208 },
+  { time: '02:25', tf: 209 },
+  { time: '02:30', tf: 210 },
+  { time: '02:33', tf: 117 },
+  { time: '02:40', tf: 212 },
+  { time: '02:45', tf: 213 },
+  { time: '02:50', tf: 214 },
+  { time: '03:00', tf: 216 },
+  { time: '03:10', tf: 218 },
+  { time: '03:15', tf: 219 },
+  { time: '03:20', tf: 220 },
+  { time: '03:30', tf: 222 },
+  { time: '03:40', tf: 224 },
+  { time: '03:45', tf: 225 },
+  { time: '03:50', tf: 226 },
+  { time: '03:55', tf: 227 },
+  { time: '04:00', tf: 228 },
+  { time: '04:10', tf: 230 },
+  { time: '04:20', tf: 232 },
+  { time: '04:25', tf: 233 },
+  { time: '04:26', tf: 583 },
+  { time: '04:30', tf: 234 },
+  { time: '04:35', tf: 235 },
+  { time: '04:40', tf: 236 },
+  { time: '04:45', tf: 237 },
+  { time: '04:50', tf: 238 },
+  { time: '05:00', tf: 240 },
+  { time: '05:05', tf: 241 },
+  { time: '05:10', tf: 242 },
+  { time: '05:15', tf: 243 },
+  { time: '05:20', tf: 244 },
+  { time: '05:25', tf: 245 },
+  { time: '05:30', tf: 246 },
+  { time: '05:35', tf: 247 },
+  { time: '05:40', tf: 248 },
+  { time: '05:50', tf: 250 },
+  { time: '05:57', tf: 419 },
+  { time: '06:00', tf: 252 },
+  { time: '06:10', tf: 254 },
+  { time: '06:15', tf: 255 },
+  { time: '06:20', tf: 256 },
+  { time: '06:25', tf: 257 },
+  { time: '06:30', tf: 258 },
+  { time: '06:35', tf: 259 },
+  { time: '06:40', tf: 260 },
+  { time: '06:50', tf: 262 },
+  { time: '07:00', tf: 264 },
+  { time: '07:05', tf: 265 },
+  { time: '07:06', tf: 102 },
+  { time: '07:09', tf: 443 },
+  { time: '07:10', tf: 266 },
+  { time: '07:15', tf: 267 },
+  { time: '07:16', tf: 668 },
+  { time: '07:20', tf: 268 },
+  { time: '07:30', tf: 270 },
+  { time: '07:40', tf: 272 },
+  { time: '07:45', tf: 273 },
+  { time: '07:50', tf: 274 },
+  { time: '07:55', tf: 275 },
+  { time: '08:00', tf: 276 },
+  { time: '08:10', tf: 139 },
+  { time: '08:15', tf: 279 },
+  { time: '08:20', tf: 280 },
+  { time: '08:30', tf: 282 },
+  { time: '08:33', tf: 233 },
+  { time: '08:40', tf: 284 },
+  { time: '08:50', tf: 286 },
+  { time: '08:55', tf: 287 },
+];
+// "HH:MM" -> tf(분) 맵으로 변환
+const RUN_SCHEDULE_MIN = {};
+for (const { time, tf } of CUSTOM_SCHEDULE) {
+  RUN_SCHEDULE_MIN[time] = tf;
+}
+console.log(`[screener] 커스텀 스케줄 로드됨: ${CUSTOM_SCHEDULE.length}개 항목`);
+
 let lastScreenerRunKey = null;
 
 setInterval(() => {
   const kst = new Date(Date.now() + 9 * 3600 * 1000); // UTC+9 KST는 DST 없음
   const h = kst.getUTCHours();
-  const m = kst.getUTCMinutes();
-  const key = `${kst.getUTCFullYear()}-${kst.getUTCMonth()}-${kst.getUTCDate()}-${h}`;
-  if (m === 58 && TARGET_KST_HOURS.has(h) && lastScreenerRunKey !== key) {
-    lastScreenerRunKey = key;
-    console.log(`[screener] scheduled trigger at KST ${h}:${m}`);
-    runScreenerJob(RUN_HOUR_TO_TIMEFRAME[h], 'schedule').catch((e) => console.log('[screener] job error:', e.message));
+  const mi = kst.getUTCMinutes();
+  const timeKey = `${String(h).padStart(2, '0')}:${String(mi).padStart(2, '0')}`;
+  const dateKey = `${kst.getUTCFullYear()}-${kst.getUTCMonth()}-${kst.getUTCDate()}-${timeKey}`;
+  if (RUN_SCHEDULE_MIN[timeKey] !== undefined && lastScreenerRunKey !== dateKey) {
+    lastScreenerRunKey = dateKey;
+    const tfMin = RUN_SCHEDULE_MIN[timeKey];
+    console.log(`[screener] scheduled trigger at KST ${timeKey}, tf=${tfMin}min`);
+    runScreenerJob(tfMin, 'schedule').catch((e) => console.log('[screener] job error:', e.message));
   }
 }, 15000);
 
@@ -813,9 +1087,9 @@ const server = http.createServer(async (req, res) => {
   // 이격도 스크리너: 수동 즉시 실행 (테스트용)
   if (reqUrl.pathname === '/screener/run') {
     try {
-      const hoursParam = reqUrl.searchParams.get('hours');
-      const forcedHours = hoursParam ? parseInt(hoursParam, 10) : undefined;
-      const result = await runScreenerJob(forcedHours);
+      const tfParam = reqUrl.searchParams.get('tf');
+      const forcedTfMin = tfParam ? parseInt(tfParam, 10) : undefined;
+      const result = await runScreenerJob(forcedTfMin);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(result || { skipped: true }));
     } catch (err) {
