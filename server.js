@@ -695,23 +695,30 @@ const RUN_SCHEDULE_MIN = {};
 for (const { time, tf } of CUSTOM_SCHEDULE) {
   RUN_SCHEDULE_MIN[time] = tf;
 }
-console.log(`[screener] 커스텀 스케줄 로드됨: ${CUSTOM_SCHEDULE.length}개 항목`);
+console.log(`[screener] 커스텀 스케줄 로드됨: ${CUSTOM_SCHEDULE.length}개 항목 (각 시각의 10초 전에 체크)`);
 
 let lastScreenerRunKey = null;
 
+// 1초마다 정밀 체크 - 각 스케줄 시각의 5초 전(=그 시각이 속한 분의 55초)에 트리거
 setInterval(() => {
   const kst = new Date(Date.now() + 9 * 3600 * 1000); // UTC+9 KST는 DST 없음
-  const h = kst.getUTCHours();
-  const mi = kst.getUTCMinutes();
-  const timeKey = `${String(h).padStart(2, '0')}:${String(mi).padStart(2, '0')}`;
-  const dateKey = `${kst.getUTCFullYear()}-${kst.getUTCMonth()}-${kst.getUTCDate()}-${timeKey}`;
-  if (RUN_SCHEDULE_MIN[timeKey] !== undefined && lastScreenerRunKey !== dateKey) {
-    lastScreenerRunKey = dateKey;
-    const tfMin = RUN_SCHEDULE_MIN[timeKey];
-    console.log(`[screener] scheduled trigger at KST ${timeKey}, tf=${tfMin}min`);
-    runScreenerJob(tfMin, 'schedule').catch((e) => console.log('[screener] job error:', e.message));
+  const sec = kst.getUTCSeconds();
+  if (sec !== 50) return; // 50초일 때만 확인 (다음 분 00초의 10초 전)
+
+  let h = kst.getUTCHours(), mi = kst.getUTCMinutes() + 1;
+  if (mi >= 60) { mi = 0; h = (h + 1) % 24; }
+  const targetKey = `${String(h).padStart(2, '0')}:${String(mi).padStart(2, '0')}`;
+
+  if (RUN_SCHEDULE_MIN[targetKey] !== undefined) {
+    const dateKey = `${kst.getUTCFullYear()}-${kst.getUTCMonth()}-${kst.getUTCDate()}-${targetKey}`;
+    if (lastScreenerRunKey !== dateKey) {
+      lastScreenerRunKey = dateKey;
+      const tfMin = RUN_SCHEDULE_MIN[targetKey];
+      console.log(`[screener] scheduled trigger 10s before KST ${targetKey}, tf=${tfMin}min`);
+      runScreenerJob(tfMin, 'schedule').catch((e) => console.log('[screener] job error:', e.message));
+    }
   }
-}, 15000);
+}, 1000);
 
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
