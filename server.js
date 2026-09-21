@@ -30,8 +30,8 @@ let upbitMarketsCache = null;
 let upbitMarketsCacheAt = 0;
 let symbolTypeCache = null; // { SYMBOL: { underlyingType, underlyingSubType } } - COIN이 아닌 것만 저장
 let symbolTypeCacheAt = 0;
-let lastScreenerResultByVariant = { early: null, close: null }; // 10초전(early) / 정마감(close) 두 방식 독립 관리
-let screenerRunningByVariant = { early: false, close: false };
+let lastScreenerResult = null;
+let screenerRunning = false;
 let binanceBannedUntil = 0; // 바이낸스 IP 차단 해제 예정 시각 (서버 전체가 공유)
 
 function isBinanceBanned() {
@@ -287,16 +287,16 @@ async function fetchUpbitTop5() {
 
 // 상위 10개(바이낸스) + 상위5개(업비트)를, 그 시각에 지정된 분단위 시간봉 "딱 하나"로 확인해서
 // 현재가가 MA5 대비 ±10% 이상 이격되면 기록하는 스크리너
-async function runScreenerJob(forcedTfMin, triggeredBy = 'manual', variant = 'close', customThreshold) {
-  if (screenerRunningByVariant[variant]) {
-    console.log(`[screener:${variant}] already running, skip this trigger`);
+async function runScreenerJob(forcedTfMin, triggeredBy = 'manual', customThreshold) {
+  if (screenerRunning) {
+    console.log('[screener] already running, skip this trigger');
     return;
   }
   if (!latestTickers.length) {
-    console.log(`[screener:${variant}] skip: no ticker snapshot yet`);
+    console.log('[screener] skip: no ticker snapshot yet');
     return;
   }
-  screenerRunningByVariant[variant] = true;
+  screenerRunning = true;
   const startedAt = Date.now();
   try {
     const tfMin = forcedTfMin || 60; // 수동 호출인데 지정 안 하면 기본 60분으로 테스트
@@ -432,21 +432,20 @@ async function runScreenerJob(forcedTfMin, triggeredBy = 'manual', variant = 'cl
       tfMinutes: tfMin,
       threshold,
       triggeredBy,
-      variant,
       results: dedupedResults,
     };
-    lastScreenerResultByVariant[variant] = result;
+    lastScreenerResult = result;
 
-    console.log(`[screener:${variant}] scan complete in ${Date.now()-startedAt}ms, tf=${tfMin}min, matched=${dedupedResults.length} (원본 ${results.length}건 중 중복제거)`);
+    console.log(`[screener] scan complete in ${Date.now()-startedAt}ms, tf=${tfMin}min, matched=${dedupedResults.length} (원본 ${results.length}건 중 중복제거)`);
 
     const msg = JSON.stringify({ type: 'screener_result', ...result });
     for (const client of clients) {
       if (client.readyState === WebSocket.OPEN) client.send(msg);
     }
   } finally {
-    screenerRunningByVariant[variant] = false;
+    screenerRunning = false;
   }
-  return lastScreenerResultByVariant[variant];
+  return lastScreenerResult;
 }
 
 // 커스텀 스케줄 (242개) - 각 시각에 그 옆의 분단위 시간봉을 그 시각 "그대로" 체크함 (1분 전 아님)
@@ -699,46 +698,28 @@ const RUN_SCHEDULE_MIN = {};
 for (const { time, tf, threshold } of CUSTOM_SCHEDULE) {
   RUN_SCHEDULE_MIN[time] = { tf, threshold };
 }
-console.log(`[screener] 커스텀 스케줄 로드됨: ${CUSTOM_SCHEDULE.length}개 항목 (10초 전 / 정마감 두 방식 동시 운영)`);
+console.log(`[screener] 커스텀 스케줄 로드됨: ${CUSTOM_SCHEDULE.length}개 항목 (각 시각의 10초 전에 체크)`);
 
-let lastEarlyRunKey = null;
-let lastCloseRunKey = null;
+let lastScreenerRunKey = null;
 
-// 1초마다 정밀 체크
-// - "early": 각 스케줄 시각의 10초 전(=그 시각이 속한 분의 50초)에 트리거
-// - "close": 각 스케줄 시각 정각(0초)에 트리거
+// 1초마다 정밀 체크 - 각 스케줄 시각의 10초 전(=그 시각이 속한 분의 50초)에 트리거
 setInterval(() => {
   const kst = new Date(Date.now() + 9 * 3600 * 1000); // UTC+9 KST는 DST 없음
   const sec = kst.getUTCSeconds();
-  const h = kst.getUTCHours(), mi = kst.getUTCMinutes();
+  if (sec !== 50) return;
 
-  if (sec === 50) {
-    // 다음 분의 10초 전
-    let th = h, tmi = mi + 1;
-    if (tmi >= 60) { tmi = 0; th = (th + 1) % 24; }
-    const targetKey = `${String(th).padStart(2, '0')}:${String(tmi).padStart(2, '0')}`;
-    if (RUN_SCHEDULE_MIN[targetKey] !== undefined) {
-      const dateKey = `${kst.getUTCFullYear()}-${kst.getUTCMonth()}-${kst.getUTCDate()}-${targetKey}-early`;
-      if (lastEarlyRunKey !== dateKey) {
-        lastEarlyRunKey = dateKey;
-        const { tf: tfMin, threshold } = RUN_SCHEDULE_MIN[targetKey];
-        console.log(`[screener:early] scheduled trigger 10s before KST ${targetKey}, tf=${tfMin}min, threshold=${threshold ?? DEVIATION_THRESHOLD_PCT}%`);
-        runScreenerJob(tfMin, 'schedule', 'early', threshold).catch((e) => console.log('[screener:early] job error:', e.message));
-      }
-    }
-  }
+  const h = kst.getUTCHours();
+  let th = h, tmi = kst.getUTCMinutes() + 1;
+  if (tmi >= 60) { tmi = 0; th = (th + 1) % 24; }
+  const targetKey = `${String(th).padStart(2, '0')}:${String(tmi).padStart(2, '0')}`;
 
-  if (sec === 0) {
-    // 지금 이 순간이 스케줄 시각 정각
-    const targetKey = `${String(h).padStart(2, '0')}:${String(mi).padStart(2, '0')}`;
-    if (RUN_SCHEDULE_MIN[targetKey] !== undefined) {
-      const dateKey = `${kst.getUTCFullYear()}-${kst.getUTCMonth()}-${kst.getUTCDate()}-${targetKey}-close`;
-      if (lastCloseRunKey !== dateKey) {
-        lastCloseRunKey = dateKey;
-        const { tf: tfMin, threshold } = RUN_SCHEDULE_MIN[targetKey];
-        console.log(`[screener:close] scheduled trigger at KST ${targetKey} (정마감), tf=${tfMin}min, threshold=${threshold ?? DEVIATION_THRESHOLD_PCT}%`);
-        runScreenerJob(tfMin, 'schedule', 'close', threshold).catch((e) => console.log('[screener:close] job error:', e.message));
-      }
+  if (RUN_SCHEDULE_MIN[targetKey] !== undefined) {
+    const dateKey = `${kst.getUTCFullYear()}-${kst.getUTCMonth()}-${kst.getUTCDate()}-${targetKey}`;
+    if (lastScreenerRunKey !== dateKey) {
+      lastScreenerRunKey = dateKey;
+      const { tf: tfMin, threshold } = RUN_SCHEDULE_MIN[targetKey];
+      console.log(`[screener] scheduled trigger 10s before KST ${targetKey}, tf=${tfMin}min, threshold=${threshold ?? DEVIATION_THRESHOLD_PCT}%`);
+      runScreenerJob(tfMin, 'schedule', threshold).catch((e) => console.log('[screener] job error:', e.message));
     }
   }
 }, 1000);
@@ -1160,10 +1141,7 @@ const server = http.createServer(async (req, res) => {
   // 이격도 스크리너: 마지막 결과 조회
   if (reqUrl.pathname === '/screener/latest') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      early: lastScreenerResultByVariant.early || { time: null, scanned: [], results: [] },
-      close: lastScreenerResultByVariant.close || { time: null, scanned: [], results: [] },
-    }));
+    res.end(JSON.stringify(lastScreenerResult || { time: null, scanned: [], results: [] }));
     return;
   }
 
@@ -1172,8 +1150,7 @@ const server = http.createServer(async (req, res) => {
     try {
       const tfParam = reqUrl.searchParams.get('tf');
       const forcedTfMin = tfParam ? parseInt(tfParam, 10) : undefined;
-      const variant = reqUrl.searchParams.get('variant') === 'early' ? 'early' : 'close';
-      const result = await runScreenerJob(forcedTfMin, 'manual', variant);
+      const result = await runScreenerJob(forcedTfMin);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(result || { skipped: true }));
     } catch (err) {
