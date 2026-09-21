@@ -242,6 +242,30 @@ function maLast(values, period) {
   return slice.reduce((a, b) => a + b, 0) / period;
 }
 
+// {o,h,l,c} 배열에서, 가장 최근 groupSize개를 묶어 합성한 "가장 최근 캔들 하나"의 OHLC를 계산
+function lastGroupOHLC(baseCandles, groupSize) {
+  const group = baseCandles.slice(-groupSize);
+  if (group.length === 0) return null;
+  const open = group[0].o;
+  const close = group[group.length - 1].c;
+  let high = -Infinity, low = Infinity;
+  for (const c of group) {
+    if (c.h > high) high = c.h;
+    if (c.l < low) low = c.l;
+  }
+  return { open, high, low, close };
+}
+
+// 양봉이면 윗꼬리(고가-종가), 음봉이면 밑꼬리(종가-저가) 기준으로
+// "꼬리/몸통 비율(%)"을 계산 - 몸통이 0(도지)이면 비율 정의 불가로 처리
+function tailBodyRatio(ohlc) {
+  const isBullish = ohlc.close >= ohlc.open;
+  const body = Math.abs(ohlc.close - ohlc.open);
+  const tail = isBullish ? (ohlc.high - ohlc.close) : (ohlc.close - ohlc.low);
+  if (body === 0) return { isBullish, ratio: null };
+  return { isBullish, ratio: (tail / body) * 100 };
+}
+
 // 업비트 KRW 마켓 상위 5개(24h 변동률 기준) 조회 - 이격 스크리너용
 async function fetchUpbitTop5() {
   const now = Date.now();
@@ -292,15 +316,26 @@ async function runScreenerJob(forcedTfMin, triggeredBy = 'manual') {
           `https://fapi.binance.com/fapi/v1/klines?symbol=${encodeURIComponent(t.s)}&interval=${binanceBase.interval}&limit=${binLimit}`,
           10000
         );
-        const closes = kl.map((k) => parseFloat(k[4]));
+        const ohlcArr = kl.map((k) => ({ o: parseFloat(k[1]), h: parseFloat(k[2]), l: parseFloat(k[3]), c: parseFloat(k[4]) }));
+        const closes = ohlcArr.map((c) => c.c);
 
         const aggClose = aggregateClosesBackward(closes, binGroupSize);
         const ma5 = maLast(aggClose, 5);
         if (ma5 === null) continue; // 데이터 부족 (극단적으로 큰 시간봉이면 1500개로도 5개를 못 채울 수 있음)
         const price = aggClose[aggClose.length - 1];
         const deviationPct = ((price - ma5) / ma5) * 100;
+        const ma5Ok = Math.abs(deviationPct) >= DEVIATION_THRESHOLD_PCT;
 
-        if (Math.abs(deviationPct) >= DEVIATION_THRESHOLD_PCT) {
+        const ohlc = lastGroupOHLC(ohlcArr, binGroupSize);
+        let ratioOk = false, isBullish = null, ratio = null;
+        if (ohlc) {
+          const r = tailBodyRatio(ohlc);
+          isBullish = r.isBullish;
+          ratio = r.ratio;
+          ratioOk = ratio !== null && ratio <= 8;
+        }
+
+        if (ma5Ok && ratioOk) {
           results.push({
             exchange: 'binance',
             symbol: t.s,
@@ -308,6 +343,8 @@ async function runScreenerJob(forcedTfMin, triggeredBy = 'manual') {
             price,
             ma5,
             deviationPct,
+            isBullish,
+            tailBodyRatio: ratio,
             change24h: parseFloat(t.P),
           });
         }
@@ -337,15 +374,26 @@ async function runScreenerJob(forcedTfMin, triggeredBy = 'manual') {
           10000,
           { 'User-Agent': 'Mozilla/5.0' }
         );
-        const closes = kl.map((c) => c.trade_price).reverse(); // 업비트는 최신순 -> 오름차순으로
+        const ohlcArr = kl.map((c) => ({ o: c.opening_price, h: c.high_price, l: c.low_price, c: c.trade_price })).reverse(); // 업비트는 최신순 -> 오름차순으로
+        const closes = ohlcArr.map((c) => c.c);
 
         const aggClose = aggregateClosesBackward(closes, upbitGroupSize);
         const ma5 = maLast(aggClose, 5);
         if (ma5 === null) continue;
         const price = aggClose[aggClose.length - 1];
         const deviationPct = ((price - ma5) / ma5) * 100;
+        const ma5Ok = Math.abs(deviationPct) >= DEVIATION_THRESHOLD_PCT;
 
-        if (Math.abs(deviationPct) >= DEVIATION_THRESHOLD_PCT) {
+        const ohlc = lastGroupOHLC(ohlcArr, upbitGroupSize);
+        let ratioOk = false, isBullish = null, ratio = null;
+        if (ohlc) {
+          const r = tailBodyRatio(ohlc);
+          isBullish = r.isBullish;
+          ratio = r.ratio;
+          ratioOk = ratio !== null && ratio <= 8;
+        }
+
+        if (ma5Ok && ratioOk) {
           results.push({
             exchange: 'upbit',
             symbol: u.market,
@@ -354,6 +402,8 @@ async function runScreenerJob(forcedTfMin, triggeredBy = 'manual') {
             price,
             ma5,
             deviationPct,
+            isBullish,
+            tailBodyRatio: ratio,
             change24h: u.changePct24h,
           });
         }
