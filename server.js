@@ -30,8 +30,8 @@ let upbitMarketsCache = null;
 let upbitMarketsCacheAt = 0;
 let symbolTypeCache = null; // { SYMBOL: { underlyingType, underlyingSubType } } - COIN이 아닌 것만 저장
 let symbolTypeCacheAt = 0;
-let lastScreenerResult = null;
-let screenerRunning = false;
+let lastScreenerResultByVariant = { early: null, close: null }; // 10초전(early) / 정마감(close) 두 방식 독립 관리
+let screenerRunningByVariant = { early: false, close: false };
 let binanceBannedUntil = 0; // 바이낸스 IP 차단 해제 예정 시각 (서버 전체가 공유)
 
 function isBinanceBanned() {
@@ -287,19 +287,20 @@ async function fetchUpbitTop5() {
 
 // 상위 10개(바이낸스) + 상위5개(업비트)를, 그 시각에 지정된 분단위 시간봉 "딱 하나"로 확인해서
 // 현재가가 MA5 대비 ±10% 이상 이격되면 기록하는 스크리너
-async function runScreenerJob(forcedTfMin, triggeredBy = 'manual') {
-  if (screenerRunning) {
-    console.log('[screener] already running, skip this trigger');
+async function runScreenerJob(forcedTfMin, triggeredBy = 'manual', variant = 'close', customThreshold) {
+  if (screenerRunningByVariant[variant]) {
+    console.log(`[screener:${variant}] already running, skip this trigger`);
     return;
   }
   if (!latestTickers.length) {
-    console.log('[screener] skip: no ticker snapshot yet');
+    console.log(`[screener:${variant}] skip: no ticker snapshot yet`);
     return;
   }
-  screenerRunning = true;
+  screenerRunningByVariant[variant] = true;
   const startedAt = Date.now();
   try {
     const tfMin = forcedTfMin || 60; // 수동 호출인데 지정 안 하면 기본 60분으로 테스트
+    const threshold = customThreshold ?? DEVIATION_THRESHOLD_PCT;
 
     const top10 = [...latestTickers]
       .sort((a, b) => parseFloat(b.P) - parseFloat(a.P))
@@ -324,7 +325,7 @@ async function runScreenerJob(forcedTfMin, triggeredBy = 'manual') {
         if (ma5 === null) continue; // 데이터 부족 (극단적으로 큰 시간봉이면 1500개로도 5개를 못 채울 수 있음)
         const price = aggClose[aggClose.length - 1];
         const deviationPct = ((price - ma5) / ma5) * 100;
-        const ma5Ok = Math.abs(deviationPct) >= DEVIATION_THRESHOLD_PCT;
+        const ma5Ok = Math.abs(deviationPct) >= threshold;
 
         const ohlc = lastGroupOHLC(ohlcArr, binGroupSize);
         let ratioOk = false, isBullish = null, ratio = null;
@@ -382,7 +383,7 @@ async function runScreenerJob(forcedTfMin, triggeredBy = 'manual') {
         if (ma5 === null) continue;
         const price = aggClose[aggClose.length - 1];
         const deviationPct = ((price - ma5) / ma5) * 100;
-        const ma5Ok = Math.abs(deviationPct) >= DEVIATION_THRESHOLD_PCT;
+        const ma5Ok = Math.abs(deviationPct) >= threshold;
 
         const ohlc = lastGroupOHLC(ohlcArr, upbitGroupSize);
         let ratioOk = false, isBullish = null, ratio = null;
@@ -425,103 +426,106 @@ async function runScreenerJob(forcedTfMin, triggeredBy = 'manual') {
     }
     const dedupedResults = Array.from(dedupedByBase.values());
 
-    lastScreenerResult = {
+    const result = {
       time: Date.now(),
       scanned: [...top10.map((t) => t.s), ...upbitTop5.map((u) => u.market)],
       tfMinutes: tfMin,
+      threshold,
       triggeredBy,
+      variant,
       results: dedupedResults,
     };
+    lastScreenerResultByVariant[variant] = result;
 
-    console.log(`[screener] scan complete in ${Date.now()-startedAt}ms, tf=${tfMin}min, matched=${dedupedResults.length} (원본 ${results.length}건 중 중복제거)`);
+    console.log(`[screener:${variant}] scan complete in ${Date.now()-startedAt}ms, tf=${tfMin}min, matched=${dedupedResults.length} (원본 ${results.length}건 중 중복제거)`);
 
-    const msg = JSON.stringify({ type: 'screener_result', ...lastScreenerResult });
+    const msg = JSON.stringify({ type: 'screener_result', ...result });
     for (const client of clients) {
       if (client.readyState === WebSocket.OPEN) client.send(msg);
     }
   } finally {
-    screenerRunning = false;
+    screenerRunningByVariant[variant] = false;
   }
-  return lastScreenerResult;
+  return lastScreenerResultByVariant[variant];
 }
 
 // 커스텀 스케줄 (242개) - 각 시각에 그 옆의 분단위 시간봉을 그 시각 "그대로" 체크함 (1분 전 아님)
 const CUSTOM_SCHEDULE = [
-  { time: '09:20', tf: 20 },
-  { time: '09:30', tf: 15 },
-  { time: '09:35', tf: 35 },
-  { time: '09:40', tf: 40 },
-  { time: '09:41', tf: 41 },
-  { time: '09:42', tf: 42 },
-  { time: '09:45', tf: 45 },
-  { time: '09:50', tf: 50 },
-  { time: '09:55', tf: 55 },
-  { time: '09:56', tf: 56 },
-  { time: '10:00', tf: 60 },
-  { time: '10:05', tf: 65 },
-  { time: '10:10', tf: 70 },
-  { time: '10:11', tf: 71 },
-  { time: '10:13', tf: 73 },
-  { time: '10:20', tf: 80 },
-  { time: '10:30', tf: 90 },
-  { time: '10:33', tf: 93 },
-  { time: '10:34', tf: 94 },
-  { time: '10:35', tf: 95 },
-  { time: '10:36', tf: 96 },
-  { time: '10:39', tf: 99 },
-  { time: '10:40', tf: 100 },
-  { time: '10:50', tf: 110 },
-  { time: '10:52', tf: 56 },
-  { time: '11:00', tf: 120 },
-  { time: '11:05', tf: 125 },
-  { time: '11:10', tf: 65 },
-  { time: '11:14', tf: 134 },
-  { time: '11:20', tf: 140 },
-  { time: '11:24', tf: 72 },
-  { time: '11:30', tf: 30 },
-  { time: '11:40', tf: 40 },
-  { time: '11:42', tf: 54 },
-  { time: '11:43', tf: 163 },
-  { time: '11:50', tf: 85 },
-  { time: '12:00', tf: 180 },
-  { time: '12:02', tf: 182 },
-  { time: '12:03', tf: 183 },
-  { time: '12:05', tf: 185 },
-  { time: '12:06', tf: 186 },
-  { time: '12:10', tf: 190 },
-  { time: '12:15', tf: 195 },
-  { time: '12:20', tf: 200 },
-  { time: '12:30', tf: 210 },
-  { time: '12:40', tf: 220 },
-  { time: '12:50', tf: 230 },
-  { time: '12:55', tf: 235 },
-  { time: '13:00', tf: 48 },
-  { time: '13:20', tf: 52 },
-  { time: '13:30', tf: 54 },
-  { time: '13:35', tf: 55 },
-  { time: '13:40', tf: 56 },
-  { time: '13:50', tf: 58 },
-  { time: '13:55', tf: 59 },
-  { time: '14:00', tf: 60 },
-  { time: '14:10', tf: 62 },
-  { time: '14:16', tf: 158 },
-  { time: '14:20', tf: 64 },
-  { time: '14:28', tf: 41 },
-  { time: '14:30', tf: 66 },
-  { time: '14:36', tf: 112 },
-  { time: '14:40', tf: 68 },
-  { time: '14:45', tf: 69 },
-  { time: '14:50', tf: 70 },
-  { time: '15:00', tf: 72 },
-  { time: '15:10', tf: 74 },
-  { time: '15:20', tf: 76 },
-  { time: '15:25', tf: 55 },
-  { time: '15:39', tf: 57 },
-  { time: '15:40', tf: 80 },
-  { time: '15:45', tf: 81 },
-  { time: '15:54', tf: 69 },
-  { time: '15:50', tf: 82 },
-  { time: '15:56', tf: 208 },
+  { time: '09:20', tf: 20, threshold: 7 },
+  { time: '09:30', tf: 15, threshold: 7 },
+  { time: '09:35', tf: 35, threshold: 7 },
+  { time: '09:40', tf: 40, threshold: 7 },
+  { time: '09:41', tf: 41, threshold: 7 },
+  { time: '09:42', tf: 42, threshold: 7 },
+  { time: '09:45', tf: 45, threshold: 7 },
+  { time: '09:50', tf: 50, threshold: 7 },
+  { time: '09:55', tf: 55, threshold: 7 },
+  { time: '09:56', tf: 56, threshold: 7 },
+  { time: '10:00', tf: 60, threshold: 7 },
+  { time: '10:05', tf: 65, threshold: 7 },
+  { time: '10:10', tf: 70, threshold: 7 },
+  { time: '10:11', tf: 71, threshold: 7 },
+  { time: '10:13', tf: 73, threshold: 7 },
+  { time: '10:20', tf: 80, threshold: 7 },
+  { time: '10:30', tf: 90, threshold: 7 },
+  { time: '10:33', tf: 93, threshold: 7 },
+  { time: '10:34', tf: 94, threshold: 7 },
+  { time: '10:35', tf: 95, threshold: 7 },
+  { time: '10:36', tf: 96, threshold: 7 },
+  { time: '10:39', tf: 99, threshold: 7 },
+  { time: '10:40', tf: 100, threshold: 7 },
+  { time: '10:50', tf: 110, threshold: 7 },
+  { time: '10:52', tf: 56, threshold: 7 },
+  { time: '11:00', tf: 120, threshold: 7 },
+  { time: '11:05', tf: 125, threshold: 7 },
+  { time: '11:10', tf: 65, threshold: 7 },
+  { time: '11:14', tf: 134, threshold: 7 },
+  { time: '11:20', tf: 140, threshold: 7 },
+  { time: '11:24', tf: 72, threshold: 7 },
+  { time: '11:30', tf: 30, threshold: 7 },
+  { time: '11:40', tf: 40, threshold: 7 },
+  { time: '11:42', tf: 54, threshold: 7 },
+  { time: '11:43', tf: 163, threshold: 7 },
+  { time: '11:50', tf: 85, threshold: 7 },
+  { time: '12:00', tf: 180, threshold: 7 },
+  { time: '12:02', tf: 182, threshold: 7 },
+  { time: '12:03', tf: 183, threshold: 7 },
+  { time: '12:05', tf: 185, threshold: 7 },
+  { time: '12:06', tf: 186, threshold: 7 },
+  { time: '12:10', tf: 190, threshold: 7 },
+  { time: '12:15', tf: 195, threshold: 7 },
+  { time: '12:20', tf: 200, threshold: 7 },
+  { time: '12:30', tf: 210, threshold: 7 },
+  { time: '12:40', tf: 220, threshold: 7 },
+  { time: '12:50', tf: 230, threshold: 7 },
+  { time: '12:55', tf: 235, threshold: 7 },
+  { time: '13:00', tf: 240, threshold: 7 },
+  { time: '13:20', tf: 260, threshold: 7 },
+  { time: '13:30', tf: 270, threshold: 7 },
+  { time: '13:35', tf: 275, threshold: 7 },
+  { time: '13:40', tf: 280, threshold: 7 },
+  { time: '13:50', tf: 290, threshold: 7 },
+  { time: '13:55', tf: 295, threshold: 7 },
+  { time: '14:00', tf: 300, threshold: 7 },
+  { time: '14:10', tf: 310, threshold: 7 },
+  { time: '14:16', tf: 158, threshold: 7 },
+  { time: '14:20', tf: 320, threshold: 7 },
+  { time: '14:28', tf: 328, threshold: 7 },
+  { time: '14:30', tf: 330, threshold: 7 },
+  { time: '14:36', tf: 112, threshold: 7 },
+  { time: '14:40', tf: 340, threshold: 7 },
+  { time: '14:45', tf: 345, threshold: 7 },
+  { time: '14:50', tf: 350, threshold: 7 },
+  { time: '15:00', tf: 360, threshold: 7 },
+  { time: '15:10', tf: 370, threshold: 7 },
+  { time: '15:20', tf: 380, threshold: 7 },
+  { time: '15:25', tf: 385, threshold: 7 },
+  { time: '15:39', tf: 399, threshold: 7 },
+  { time: '15:40', tf: 200, threshold: 7 },
+  { time: '15:45', tf: 405, threshold: 7 },
+  { time: '15:54', tf: 414, threshold: 7 },
+  { time: '15:50', tf: 410, threshold: 7 },
+  { time: '15:56', tf: 416, threshold: 7 },
   { time: '16:00', tf: 84 },
   { time: '16:10', tf: 86 },
   { time: '16:15', tf: 87 },
@@ -532,7 +536,7 @@ const CUSTOM_SCHEDULE = [
   { time: '16:42', tf: 77 },
   { time: '16:45', tf: 93 },
   { time: '16:50', tf: 94 },
-  { time: '17:00', tf: 96 },
+  { time: '17:00', tf: 480 },
   { time: '17:10', tf: 98 },
   { time: '17:20', tf: 100 },
   { time: '17:24', tf: 84 },
@@ -690,32 +694,51 @@ const CUSTOM_SCHEDULE = [
   { time: '08:50', tf: 286 },
   { time: '08:55', tf: 287 },
 ];
-// "HH:MM" -> tf(분) 맵으로 변환
+// "HH:MM" -> { tf, threshold } 맵으로 변환 (threshold 없으면 기본값 사용)
 const RUN_SCHEDULE_MIN = {};
-for (const { time, tf } of CUSTOM_SCHEDULE) {
-  RUN_SCHEDULE_MIN[time] = tf;
+for (const { time, tf, threshold } of CUSTOM_SCHEDULE) {
+  RUN_SCHEDULE_MIN[time] = { tf, threshold };
 }
-console.log(`[screener] 커스텀 스케줄 로드됨: ${CUSTOM_SCHEDULE.length}개 항목 (각 시각의 10초 전에 체크)`);
+console.log(`[screener] 커스텀 스케줄 로드됨: ${CUSTOM_SCHEDULE.length}개 항목 (10초 전 / 정마감 두 방식 동시 운영)`);
 
-let lastScreenerRunKey = null;
+let lastEarlyRunKey = null;
+let lastCloseRunKey = null;
 
-// 1초마다 정밀 체크 - 각 스케줄 시각의 5초 전(=그 시각이 속한 분의 55초)에 트리거
+// 1초마다 정밀 체크
+// - "early": 각 스케줄 시각의 10초 전(=그 시각이 속한 분의 50초)에 트리거
+// - "close": 각 스케줄 시각 정각(0초)에 트리거
 setInterval(() => {
   const kst = new Date(Date.now() + 9 * 3600 * 1000); // UTC+9 KST는 DST 없음
   const sec = kst.getUTCSeconds();
-  if (sec !== 50) return; // 50초일 때만 확인 (다음 분 00초의 10초 전)
+  const h = kst.getUTCHours(), mi = kst.getUTCMinutes();
 
-  let h = kst.getUTCHours(), mi = kst.getUTCMinutes() + 1;
-  if (mi >= 60) { mi = 0; h = (h + 1) % 24; }
-  const targetKey = `${String(h).padStart(2, '0')}:${String(mi).padStart(2, '0')}`;
+  if (sec === 50) {
+    // 다음 분의 10초 전
+    let th = h, tmi = mi + 1;
+    if (tmi >= 60) { tmi = 0; th = (th + 1) % 24; }
+    const targetKey = `${String(th).padStart(2, '0')}:${String(tmi).padStart(2, '0')}`;
+    if (RUN_SCHEDULE_MIN[targetKey] !== undefined) {
+      const dateKey = `${kst.getUTCFullYear()}-${kst.getUTCMonth()}-${kst.getUTCDate()}-${targetKey}-early`;
+      if (lastEarlyRunKey !== dateKey) {
+        lastEarlyRunKey = dateKey;
+        const { tf: tfMin, threshold } = RUN_SCHEDULE_MIN[targetKey];
+        console.log(`[screener:early] scheduled trigger 10s before KST ${targetKey}, tf=${tfMin}min, threshold=${threshold ?? DEVIATION_THRESHOLD_PCT}%`);
+        runScreenerJob(tfMin, 'schedule', 'early', threshold).catch((e) => console.log('[screener:early] job error:', e.message));
+      }
+    }
+  }
 
-  if (RUN_SCHEDULE_MIN[targetKey] !== undefined) {
-    const dateKey = `${kst.getUTCFullYear()}-${kst.getUTCMonth()}-${kst.getUTCDate()}-${targetKey}`;
-    if (lastScreenerRunKey !== dateKey) {
-      lastScreenerRunKey = dateKey;
-      const tfMin = RUN_SCHEDULE_MIN[targetKey];
-      console.log(`[screener] scheduled trigger 10s before KST ${targetKey}, tf=${tfMin}min`);
-      runScreenerJob(tfMin, 'schedule').catch((e) => console.log('[screener] job error:', e.message));
+  if (sec === 0) {
+    // 지금 이 순간이 스케줄 시각 정각
+    const targetKey = `${String(h).padStart(2, '0')}:${String(mi).padStart(2, '0')}`;
+    if (RUN_SCHEDULE_MIN[targetKey] !== undefined) {
+      const dateKey = `${kst.getUTCFullYear()}-${kst.getUTCMonth()}-${kst.getUTCDate()}-${targetKey}-close`;
+      if (lastCloseRunKey !== dateKey) {
+        lastCloseRunKey = dateKey;
+        const { tf: tfMin, threshold } = RUN_SCHEDULE_MIN[targetKey];
+        console.log(`[screener:close] scheduled trigger at KST ${targetKey} (정마감), tf=${tfMin}min, threshold=${threshold ?? DEVIATION_THRESHOLD_PCT}%`);
+        runScreenerJob(tfMin, 'schedule', 'close', threshold).catch((e) => console.log('[screener:close] job error:', e.message));
+      }
     }
   }
 }, 1000);
@@ -1137,7 +1160,10 @@ const server = http.createServer(async (req, res) => {
   // 이격도 스크리너: 마지막 결과 조회
   if (reqUrl.pathname === '/screener/latest') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(lastScreenerResult || { time: null, scanned: [], results: [] }));
+    res.end(JSON.stringify({
+      early: lastScreenerResultByVariant.early || { time: null, scanned: [], results: [] },
+      close: lastScreenerResultByVariant.close || { time: null, scanned: [], results: [] },
+    }));
     return;
   }
 
@@ -1146,7 +1172,8 @@ const server = http.createServer(async (req, res) => {
     try {
       const tfParam = reqUrl.searchParams.get('tf');
       const forcedTfMin = tfParam ? parseInt(tfParam, 10) : undefined;
-      const result = await runScreenerJob(forcedTfMin);
+      const variant = reqUrl.searchParams.get('variant') === 'early' ? 'early' : 'close';
+      const result = await runScreenerJob(forcedTfMin, 'manual', variant);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(result || { skipped: true }));
     } catch (err) {
