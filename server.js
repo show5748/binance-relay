@@ -725,6 +725,134 @@ setInterval(() => {
   }
 }, 1000);
 
+// ── 고정종목 스크리너 (SOXL/MSTR/CRCL/BNB) ──────────────────────
+// 같은 242개 스케줄(시각별 분단위 시간봉)을 그대로 쓰되, 조건은 아래처럼 시간대별로 다름:
+//   09:20~21:50: 꼬리/몸통 비율 8% 이하, MA5 이격 0.54% 이상
+//   21:50 이후~08:55: 꼬리/몸통 비율 7.8% 이하, MA5 이격 1% 이상
+const FIXED_SYMBOLS = ['SOXLUSDT', 'MSTRUSDT', 'CRCLUSDT', 'BNBUSDT'];
+const fixedSegmentAKeys = new Set(); // 09:20~21:50 구간에 속하는 시각들
+{
+  let inSegA = true;
+  for (const { time } of CUSTOM_SCHEDULE) {
+    if (inSegA) fixedSegmentAKeys.add(time);
+    if (time === '21:50') inSegA = false;
+  }
+}
+function fixedThresholdsFor(timeKey) {
+  if (fixedSegmentAKeys.has(timeKey)) return { ma5Threshold: 0.54, tailRatioThreshold: 8 };
+  return { ma5Threshold: 1, tailRatioThreshold: 7.8 };
+}
+
+let lastFixedScreenerResult = null;
+let fixedScreenerRunning = false;
+
+async function runFixedScreenerJob(forcedTfMin, ma5Threshold, tailRatioThreshold, triggeredBy = 'manual') {
+  if (fixedScreenerRunning) {
+    console.log('[fixedScreener] already running, skip this trigger');
+    return;
+  }
+  fixedScreenerRunning = true;
+  const startedAt = Date.now();
+  try {
+    const tfMin = forcedTfMin || 60;
+    const ma5Th = ma5Threshold ?? 0.54;
+    const tailTh = tailRatioThreshold ?? 8;
+    const base = chooseBinanceBase(tfMin);
+    const groupSize = tfMin / base.min;
+    const limit = Math.min(groupSize * 6 + 10, 1500);
+
+    const results = [];
+    for (const symbol of FIXED_SYMBOLS) {
+      try {
+        const kl = await httpsGetJsonBinance(
+          `https://fapi.binance.com/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=${base.interval}&limit=${limit}`,
+          10000
+        );
+        const ohlcArr = kl.map((k) => ({ o: parseFloat(k[1]), h: parseFloat(k[2]), l: parseFloat(k[3]), c: parseFloat(k[4]) }));
+        const closes = ohlcArr.map((c) => c.c);
+
+        const aggClose = aggregateClosesBackward(closes, groupSize);
+        const ma5 = maLast(aggClose, 5);
+        if (ma5 === null) continue;
+        const price = aggClose[aggClose.length - 1];
+        const deviationPct = ((price - ma5) / ma5) * 100;
+        const ma5Ok = Math.abs(deviationPct) >= ma5Th;
+
+        const ohlc = lastGroupOHLC(ohlcArr, groupSize);
+        let ratioOk = false, isBullish = null, ratio = null;
+        if (ohlc) {
+          const r = tailBodyRatio(ohlc);
+          isBullish = r.isBullish;
+          ratio = r.ratio;
+          ratioOk = ratio !== null && ratio <= tailTh;
+        }
+
+        const ticker = latestTickers.find((t) => t.s === symbol);
+        if (ma5Ok && ratioOk) {
+          results.push({
+            symbol,
+            tfMinutes: tfMin,
+            price,
+            ma5,
+            deviationPct,
+            isBullish,
+            tailBodyRatio: ratio,
+            change24h: ticker ? parseFloat(ticker.P) : null,
+          });
+        }
+      } catch (err) {
+        console.log('[fixedScreener] symbol error', symbol, err.message);
+        if (err.isBanSkip) break;
+      }
+      await sleep(250);
+    }
+
+    const result = {
+      time: Date.now(),
+      scanned: FIXED_SYMBOLS,
+      tfMinutes: tfMin,
+      ma5Threshold: ma5Th,
+      tailRatioThreshold: tailTh,
+      triggeredBy,
+      results,
+    };
+    lastFixedScreenerResult = result;
+    console.log(`[fixedScreener] scan complete in ${Date.now()-startedAt}ms, tf=${tfMin}min, matched=${results.length}`);
+
+    const msg = JSON.stringify({ type: 'fixed_screener_result', ...result });
+    for (const client of clients) {
+      if (client.readyState === WebSocket.OPEN) client.send(msg);
+    }
+  } finally {
+    fixedScreenerRunning = false;
+  }
+  return lastFixedScreenerResult;
+}
+
+// 메인 스크리너랑 같은 스케줄, 같은 타이밍(10초 전)에 같이 실행
+let lastFixedScreenerRunKey = null;
+setInterval(() => {
+  const kst = new Date(Date.now() + 9 * 3600 * 1000);
+  const sec = kst.getUTCSeconds();
+  if (sec !== 50) return;
+
+  const h = kst.getUTCHours();
+  let th = h, tmi = kst.getUTCMinutes() + 1;
+  if (tmi >= 60) { tmi = 0; th = (th + 1) % 24; }
+  const targetKey = `${String(th).padStart(2, '0')}:${String(tmi).padStart(2, '0')}`;
+
+  if (RUN_SCHEDULE_MIN[targetKey] !== undefined) {
+    const dateKey = `${kst.getUTCFullYear()}-${kst.getUTCMonth()}-${kst.getUTCDate()}-${targetKey}-fixed`;
+    if (lastFixedScreenerRunKey !== dateKey) {
+      lastFixedScreenerRunKey = dateKey;
+      const { tf: tfMin } = RUN_SCHEDULE_MIN[targetKey];
+      const { ma5Threshold, tailRatioThreshold } = fixedThresholdsFor(targetKey);
+      console.log(`[fixedScreener] scheduled trigger 10s before KST ${targetKey}, tf=${tfMin}min, ma5>=${ma5Threshold}%, tail<=${tailRatioThreshold}%`);
+      runFixedScreenerJob(tfMin, ma5Threshold, tailRatioThreshold, 'schedule').catch((e) => console.log('[fixedScreener] job error:', e.message));
+    }
+  }
+}, 1000);
+
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET');
@@ -1152,6 +1280,34 @@ const server = http.createServer(async (req, res) => {
       const tfParam = reqUrl.searchParams.get('tf');
       const forcedTfMin = tfParam ? parseInt(tfParam, 10) : undefined;
       const result = await runScreenerJob(forcedTfMin);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result || { skipped: true }));
+    } catch (err) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // 고정종목(SOXL/MSTR/CRCL/BNB) 스크리너: 마지막 결과 조회
+  if (reqUrl.pathname === '/screener/fixed/latest') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(lastFixedScreenerResult || { time: null, scanned: [], results: [] }));
+    return;
+  }
+
+  // 고정종목 스크리너: 수동 즉시 실행 (테스트용)
+  if (reqUrl.pathname === '/screener/fixed/run') {
+    try {
+      const tfParam = reqUrl.searchParams.get('tf');
+      const forcedTfMin = tfParam ? parseInt(tfParam, 10) : undefined;
+      const ma5Param = reqUrl.searchParams.get('ma5');
+      const tailParam = reqUrl.searchParams.get('tail');
+      const result = await runFixedScreenerJob(
+        forcedTfMin,
+        ma5Param ? parseFloat(ma5Param) : undefined,
+        tailParam ? parseFloat(tailParam) : undefined
+      );
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(result || { skipped: true }));
     } catch (err) {
