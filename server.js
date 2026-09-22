@@ -517,6 +517,7 @@ const CUSTOM_SCHEDULE = [
   { time: '14:50', tf: 350, threshold: 7 },
   { time: '15:00', tf: 360, threshold: 7 },
   { time: '15:10', tf: 370, threshold: 7 },
+  { time: '15:15', tf: 375, threshold: 7 },
   { time: '15:20', tf: 380, threshold: 7 },
   { time: '15:25', tf: 385, threshold: 7 },
   { time: '15:39', tf: 399, threshold: 7 },
