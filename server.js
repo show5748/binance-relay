@@ -727,11 +727,11 @@ setInterval(() => {
   }
 }, 1000);
 
-// ── 고정종목 스크리너 (SOXL/MSTR/CRCL/BNB) ──────────────────────
+// ── 고정종목 스크리너 (SOXL/MSTR/CRCL/BNB/BTC/ETH) ──────────────────────
 // 같은 242개 스케줄(시각별 분단위 시간봉)을 그대로 쓰되, 조건은 아래처럼 시간대별로 다름:
 //   09:20~21:50: 꼬리/몸통 비율 8% 이하, MA5 이격 0.54% 이상
 //   21:50 이후~08:55: 꼬리/몸통 비율 7.8% 이하, MA5 이격 1% 이상
-const FIXED_SYMBOLS = ['SOXLUSDT', 'MSTRUSDT', 'CRCLUSDT', 'BNBUSDT'];
+const FIXED_SYMBOLS = ['SOXLUSDT', 'MSTRUSDT', 'CRCLUSDT', 'BNBUSDT', 'BTCUSDT', 'ETHUSDT'];
 const fixedSegmentAKeys = new Set(); // 09:20~21:50 구간에 속하는 시각들
 {
   let inSegA = true;
@@ -1291,7 +1291,7 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
-  // 고정종목(SOXL/MSTR/CRCL/BNB) 스크리너: 마지막 결과 조회
+  // 고정종목(SOXL/MSTR/CRCL/BNB/BTC/ETH) 스크리너: 마지막 결과 조회
   if (reqUrl.pathname === '/screener/fixed/latest') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(lastFixedScreenerResult || { time: null, scanned: [], results: [] }));
