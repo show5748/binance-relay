@@ -549,7 +549,7 @@ const CUSTOM_SCHEDULE = [
   { time: '17:45', tf: 105 },
   { time: '17:50', tf: 106 },
   { time: '17:55', tf: 107 },
-  { time: '18:00', tf: 108 },
+  { time: '18:00', tf: 540 },
   { time: '18:05', tf: 109 },
   { time: '18:10', tf: 110 },
   { time: '18:15', tf: 111 },
