@@ -785,7 +785,9 @@ async function runFixedScreenerJob(forcedTfMin, ma5Threshold, tailRatioThreshold
         if (ma5 === null) continue;
         const price = aggClose[aggClose.length - 1];
         const deviationPct = ((price - ma5) / ma5) * 100;
-        const ma5Ok = Math.abs(deviationPct) >= ma5Th;
+        // BTCUSDT는 시간대 상관없이 항상 MA5 0.54% 기준 (다른 종목은 시간대별 세그먼트 임계값 그대로)
+        const symbolMa5Th = symbol === 'BTCUSDT' ? 0.54 : ma5Th;
+        const ma5Ok = Math.abs(deviationPct) >= symbolMa5Th;
 
         const ohlc = lastGroupOHLC(ohlcArr, groupSize);
         let ratioOk = false, isBullish = null, ratio = null;
