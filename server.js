@@ -664,6 +664,7 @@ const CUSTOM_SCHEDULE = [
   { time: '04:40', tf: 236, disp: 1180 },
   { time: '04:45', tf: 237, disp: 1185 },
   { time: '04:50', tf: 238, disp: 1190 },
+  { time: '04:55', tf: 239, disp: 1195 },
   { time: '05:00', tf: 240, disp: 1200 },
   { time: '05:05', tf: 241, disp: 1205 },
   { time: '05:10', tf: 242, disp: 1210 },
