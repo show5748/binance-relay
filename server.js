@@ -337,7 +337,9 @@ async function runScreenerJob(forcedTfMin, triggeredBy = 'manual', customThresho
           ratioOk = ratio !== null && ratio <= 8;
         }
 
-        if (ma5Ok && ratioOk) {
+        // 방향 조건: 종가 < MA5 → 음봉만 통과, 종가 > MA5 → 양봉만 통과
+        const directionOk = isBullish !== null && ((price > ma5 && isBullish === true) || (price < ma5 && isBullish === false));
+        if (ma5Ok && ratioOk && directionOk) {
           results.push({
             exchange: 'binance',
             symbol: t.s,
@@ -396,7 +398,9 @@ async function runScreenerJob(forcedTfMin, triggeredBy = 'manual', customThresho
           ratioOk = ratio !== null && ratio <= 8;
         }
 
-        if (ma5Ok && ratioOk) {
+        // 방향 조건: 종가 < MA5 → 음봉만 통과, 종가 > MA5 → 양봉만 통과
+        const directionOk = isBullish !== null && ((price > ma5 && isBullish === true) || (price < ma5 && isBullish === false));
+        if (ma5Ok && ratioOk && directionOk) {
           results.push({
             exchange: 'upbit',
             symbol: u.market,
@@ -738,7 +742,7 @@ setInterval(() => {
 // 같은 242개 스케줄(시각별 분단위 시간봉)을 그대로 쓰되, 조건은 아래처럼 시간대별로 다름:
 //   09:20~21:50: 꼬리/몸통 비율 8% 이하, MA5 이격 0.54% 이상
 //   21:50 이후~08:55: 꼬리/몸통 비율 7.8% 이하, MA5 이격 1% 이상
-const FIXED_SYMBOLS = ['SOXLUSDT', 'MSTRUSDT', 'CRCLUSDT', 'BNBUSDT', 'BTCUSDT', 'ETHUSDT'];
+const FIXED_SYMBOLS = ['SOXLUSDT', 'MSTRUSDT', 'CRCLUSDT', 'BNBUSDT', 'BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'TQQQUSDT'];
 const fixedSegmentAKeys = new Set(); // 09:20~21:50 구간에 속하는 시각들
 {
   let inSegA = true;
@@ -800,7 +804,9 @@ async function runFixedScreenerJob(forcedTfMin, ma5Threshold, tailRatioThreshold
         }
 
         const ticker = latestTickers.find((t) => t.s === symbol);
-        if (ma5Ok && ratioOk) {
+        // 방향 조건: 종가 < MA5 → 음봉만 통과, 종가 > MA5 → 양봉만 통과
+        const directionOk = isBullish !== null && ((price > ma5 && isBullish === true) || (price < ma5 && isBullish === false));
+        if (ma5Ok && ratioOk && directionOk) {
           results.push({
             symbol,
             tfMinutes: shownTf,
