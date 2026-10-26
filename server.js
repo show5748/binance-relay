@@ -266,8 +266,8 @@ function tailBodyRatio(ohlc) {
   return { isBullish, ratio: (tail / body) * 100 };
 }
 
-// 업비트 KRW 마켓 상위 5개(24h 변동률 기준) 조회 - 이격 스크리너용
-async function fetchUpbitTop5() {
+// 업비트 KRW 마켓 전체를 24h 변동률 내림차순으로 정렬해서 돌려줌
+async function fetchUpbitRanked() {
   const now = Date.now();
   if (!upbitMarketsCache || now - upbitMarketsCacheAt > 3600000) {
     const all = await httpsGetJson('https://api.upbit.com/v1/market/all?isDetails=false', 10000, { 'User-Agent': 'Mozilla/5.0' });
@@ -281,8 +281,12 @@ async function fetchUpbitTop5() {
   const data = await httpsGetJson(`https://api.upbit.com/v1/ticker?markets=${marketList}`, 10000, { 'User-Agent': 'Mozilla/5.0' });
   return data
     .map((t) => ({ market: t.market, koreanName: nameByMarket.get(t.market) || '', changePct24h: t.signed_change_rate * 100 }))
-    .sort((a, b) => b.changePct24h - a.changePct24h)
-    .slice(0, 5);
+    .sort((a, b) => b.changePct24h - a.changePct24h);
+}
+
+// 업비트 KRW 마켓 상위 5개(24h 변동률 기준) 조회 - 이격 스크리너용
+async function fetchUpbitTop5() {
+  return (await fetchUpbitRanked()).slice(0, 5);
 }
 
 // 상위 10개(바이낸스) + 상위5개(업비트)를, 그 시각에 지정된 분단위 시간봉 "딱 하나"로 확인해서
@@ -873,6 +877,223 @@ setInterval(() => {
   }
 }, 1000);
 
+// ── 일·주봉 마감 스크리너 ──────────────────────────────────────────────
+// 매일 KST 08:59:50(= 바이낸스/업비트 일봉 마감 10초 전)에 실행.
+// "오늘 마감되는" 봉만 체크 - 마감 판정은 Pine 'Daily Cycle Close Finder' 규칙을 그대로 따름:
+//   - 일 사이클 N일봉: 매년 1/1 기준 barCount(0부터, 윤일 2/29는 3/1과 같은 값)가 N의 배수인 날 마감 (1일봉은 매일)
+//   - 주봉: 일요일(UTC) 일봉이 마감될 때 = 월요일 09:00(KST)에 주봉 마감
+// 대상: 바이낸스 24h 변동률 상위5+하위5, 업비트 상위5+하위5
+// 조건: 종가-MA5 이격 10% 이상, 꼬리/몸통 3.2% 이하, 방향(종가>MA5→양봉 / 종가<MA5→음봉)
+// 결과는 같은 봉의 다음 마감 시각까지 유지되고, 화면에서 X로 닫을 수 있음 (서버 메모리 보관 - 재시작하면 초기화)
+const CYCLE_MA5_PCT = 10;
+const CYCLE_TAIL_MAX = 3.2;
+const CYCLE_DAY_PERIODS = [1, 2, 3, 4, 5, 6, 7];
+const DAYS_BEFORE_MONTH_NONLEAP = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+
+function cycleBarCount(utcDate) {
+  return DAYS_BEFORE_MONTH_NONLEAP[utcDate.getUTCMonth()] + utcDate.getUTCDate() - 1;
+}
+
+// utcDate 날짜의 일봉이 마감될 때 같이 마감되는 봉 목록 (예: ['1D','2D','6D','1W'])
+function closingCycleTfs(utcDate, force = false) {
+  const out = [];
+  const bar = cycleBarCount(utcDate);
+  for (const n of CYCLE_DAY_PERIODS) {
+    if (force || n === 1 || bar % n === 0) out.push({ key: `${n}D`, days: n, weekly: false });
+  }
+  if (force || utcDate.getUTCDay() === 0) out.push({ key: '1W', days: 7, weekly: true });
+  return out;
+}
+
+// {o,h,l,c} 오름차순 배열로 N개씩 묶은 마지막 봉 판정
+function judgeCycleCandle(ohlcArr, groupSize) {
+  if (ohlcArr.length < groupSize * 5) return null; // MA5에 필요한 봉 수 부족
+  const closes = ohlcArr.map((c) => c.c);
+  const aggClose = aggregateClosesBackward(closes, groupSize);
+  const ma5 = maLast(aggClose, 5);
+  if (ma5 === null) return null;
+  const price = aggClose[aggClose.length - 1];
+  const deviationPct = ((price - ma5) / ma5) * 100;
+  const ohlc = lastGroupOHLC(ohlcArr, groupSize);
+  if (!ohlc) return null;
+  const r = tailBodyRatio(ohlc);
+  const ma5Ok = Math.abs(deviationPct) >= CYCLE_MA5_PCT;
+  const ratioOk = r.ratio !== null && r.ratio <= CYCLE_TAIL_MAX;
+  const directionOk = r.isBullish !== null && ((price > ma5 && r.isBullish === true) || (price < ma5 && r.isBullish === false));
+  return { pass: ma5Ok && ratioOk && directionOk, price, ma5, deviationPct, isBullish: r.isBullish, ratio: r.ratio };
+}
+
+const cycleAlerts = new Map(); // id -> item
+let lastCycleMeta = { time: null, scanned: [], closing: [], triggeredBy: null };
+let cycleRunning = false;
+
+function activeCycleItems() {
+  const now = Date.now();
+  for (const [id, it] of cycleAlerts) {
+    if (it.expiresAt <= now) cycleAlerts.delete(id);
+  }
+  return Array.from(cycleAlerts.values()).sort((a, b) => b.firedAt - a.firedAt);
+}
+
+function broadcastCycle(extra = {}) {
+  const msg = JSON.stringify({ type: 'cycle_screener_result', ...lastCycleMeta, items: activeCycleItems(), newCount: 0, ...extra });
+  for (const client of clients) {
+    if (client.readyState === WebSocket.OPEN) client.send(msg);
+  }
+}
+
+async function runCycleScreenerJob({ triggeredBy = 'manual', force = false } = {}) {
+  if (cycleRunning) {
+    console.log('[cycleScreener] already running, skip');
+    return;
+  }
+  if (!latestTickers.length) {
+    console.log('[cycleScreener] skip: no ticker snapshot yet');
+    return;
+  }
+  cycleRunning = true;
+  const startedAt = Date.now();
+  try {
+    // 일봉이 마감되는 "그 날짜"(UTC) = 실행 시각이 KST 08:59:50이면 UTC로는 아직 23:59:50인 오늘 날짜
+    const todayUtc = new Date(Math.floor(Date.now() / 86400000) * 86400000);
+    const closing = closingCycleTfs(todayUtc, force);
+    const dayTfs = closing.filter((c) => !c.weekly);
+    const weekTf = closing.find((c) => c.weekly);
+    const todayOpenMs = todayUtc.getTime();
+    const weekOpenMs = todayOpenMs - 6 * 86400000; // 일요일 기준 이번 주 월요일 00:00 UTC
+
+    const usdt = latestTickers.filter((t) => t.s.endsWith('USDT')).sort((a, b) => parseFloat(b.P) - parseFloat(a.P));
+    const binTargets = [...usdt.slice(0, 5), ...usdt.slice(-5).reverse()];
+    const binSeen = new Set();
+    const binList = binTargets.filter((t) => (binSeen.has(t.s) ? false : (binSeen.add(t.s), true)));
+
+    const hits = [];
+    const addHit = (exchange, symbol, koreanName, change24h, tf, j) => {
+      hits.push({
+        id: `${exchange}:${symbol}:${tf.key}`,
+        exchange, symbol, koreanName, change24h,
+        tf: tf.key, tfDays: tf.days,
+        price: j.price, ma5: j.ma5, deviationPct: j.deviationPct, isBullish: j.isBullish, tailBodyRatio: j.ratio,
+      });
+    };
+
+    for (const t of binList) {
+      try {
+        if (dayTfs.length) {
+          const kl = await httpsGetJsonBinance(`https://fapi.binance.com/fapi/v1/klines?symbol=${encodeURIComponent(t.s)}&interval=1d&limit=45`, 10000);
+          if (kl.length && (force || kl[kl.length - 1][0] === todayOpenMs)) {
+            const ohlcArr = kl.map((k) => ({ o: parseFloat(k[1]), h: parseFloat(k[2]), l: parseFloat(k[3]), c: parseFloat(k[4]) }));
+            for (const tf of dayTfs) {
+              const j = judgeCycleCandle(ohlcArr, tf.days);
+              if (j && j.pass) addHit('binance', t.s, '', parseFloat(t.P), tf, j);
+            }
+          }
+        }
+        if (weekTf) {
+          const kl = await httpsGetJsonBinance(`https://fapi.binance.com/fapi/v1/klines?symbol=${encodeURIComponent(t.s)}&interval=1w&limit=10`, 10000);
+          if (kl.length && (force || kl[kl.length - 1][0] === weekOpenMs)) {
+            const ohlcArr = kl.map((k) => ({ o: parseFloat(k[1]), h: parseFloat(k[2]), l: parseFloat(k[3]), c: parseFloat(k[4]) }));
+            const j = judgeCycleCandle(ohlcArr, 1);
+            if (j && j.pass) addHit('binance', t.s, '', parseFloat(t.P), weekTf, j);
+          }
+        }
+      } catch (err) {
+        console.log('[cycleScreener] 바이낸스 심볼 에러', t.s, err.message);
+        if (/418|429|banned/i.test(err.message)) break;
+      }
+      await sleep(300);
+    }
+
+    let upList = [];
+    try {
+      const ranked = await fetchUpbitRanked();
+      const seen = new Set();
+      upList = [...ranked.slice(0, 5), ...ranked.slice(-5).reverse()].filter((u) => (seen.has(u.market) ? false : (seen.add(u.market), true)));
+    } catch (err) {
+      console.log('[cycleScreener] 업비트 순위 조회 실패:', err.message);
+    }
+    const upUtcMs = (c) => Date.parse(c.candle_date_time_utc + 'Z');
+    for (const u of upList) {
+      try {
+        if (dayTfs.length) {
+          const kl = await httpsGetJson(`https://api.upbit.com/v1/candles/days?market=${encodeURIComponent(u.market)}&count=45`, 10000, { 'User-Agent': 'Mozilla/5.0' });
+          const asc = [...kl].reverse();
+          if (asc.length && (force || upUtcMs(asc[asc.length - 1]) === todayOpenMs)) {
+            const ohlcArr = asc.map((c) => ({ o: c.opening_price, h: c.high_price, l: c.low_price, c: c.trade_price }));
+            for (const tf of dayTfs) {
+              const j = judgeCycleCandle(ohlcArr, tf.days);
+              if (j && j.pass) addHit('upbit', u.market, u.koreanName, u.changePct24h, tf, j);
+            }
+          }
+          await sleep(250);
+        }
+        if (weekTf) {
+          const kl = await httpsGetJson(`https://api.upbit.com/v1/candles/weeks?market=${encodeURIComponent(u.market)}&count=10`, 10000, { 'User-Agent': 'Mozilla/5.0' });
+          const asc = [...kl].reverse();
+          if (asc.length && (force || upUtcMs(asc[asc.length - 1]) === weekOpenMs)) {
+            const ohlcArr = asc.map((c) => ({ o: c.opening_price, h: c.high_price, l: c.low_price, c: c.trade_price }));
+            const j = judgeCycleCandle(ohlcArr, 1);
+            if (j && j.pass) addHit('upbit', u.market, u.koreanName, u.changePct24h, weekTf, j);
+          }
+          await sleep(250);
+        }
+      } catch (err) {
+        console.log('[cycleScreener] 업비트 심볼 에러', u.market, err.message);
+      }
+    }
+
+    // 같은 코인+같은 봉이 양쪽에 걸리면 바이낸스 우선
+    const baseOf = (h) => (h.exchange === 'binance' ? h.symbol.replace(/USDT$/, '') : h.symbol.replace(/^KRW-/, ''));
+    const byKey = new Map();
+    for (const h of hits) {
+      const k = `${baseOf(h)}:${h.tf}`;
+      const ex = byKey.get(k);
+      if (!ex || (ex.exchange === 'upbit' && h.exchange === 'binance')) byKey.set(k, h);
+    }
+    const finalHits = Array.from(byKey.values());
+
+    const meta = {
+      time: Date.now(),
+      scanned: [...binList.map((t) => t.s), ...upList.map((u) => u.market)],
+      closing: closing.map((c) => c.key),
+      triggeredBy,
+    };
+
+    if (!force && triggeredBy === 'schedule') {
+      activeCycleItems(); // 만료분 정리
+      const firedAt = Date.now();
+      let newCount = 0;
+      for (const h of finalHits) {
+        if (cycleAlerts.has(h.id)) continue; // 같은 봉이 이미 목록에 있으면 중복 알람 안 함
+        cycleAlerts.set(h.id, { ...h, firedAt, expiresAt: firedAt + h.tfDays * 86400000 });
+        newCount++;
+      }
+      lastCycleMeta = meta;
+      console.log(`[cycleScreener] scan complete in ${Date.now() - startedAt}ms, closing=${meta.closing.join(',')}, matched=${finalHits.length}, new=${newCount}`);
+      broadcastCycle({ newCount });
+    } else {
+      // 수동/강제 실행: 저장도 알람도 하지 않고 결과만 돌려줌 (테스트용)
+      console.log(`[cycleScreener] manual scan ${Date.now() - startedAt}ms, closing=${meta.closing.join(',')}, matched=${finalHits.length} (저장 안 함)`);
+      return { ...meta, hits: finalHits };
+    }
+    return { ...meta, hits: finalHits };
+  } finally {
+    cycleRunning = false;
+  }
+}
+
+// 매일 KST 08:59:50 (UTC 23:59:50) 실행
+let lastCycleRunKey = null;
+setInterval(() => {
+  const kst = new Date(Date.now() + 9 * 3600 * 1000);
+  if (kst.getUTCHours() !== 8 || kst.getUTCMinutes() !== 59 || kst.getUTCSeconds() !== 50) return;
+  const dateKey = `${kst.getUTCFullYear()}-${kst.getUTCMonth()}-${kst.getUTCDate()}-cycle`;
+  if (lastCycleRunKey === dateKey) return;
+  lastCycleRunKey = dateKey;
+  console.log('[cycleScreener] scheduled trigger 10s before KST 09:00');
+  runCycleScreenerJob({ triggeredBy: 'schedule' }).catch((e) => console.log('[cycleScreener] job error:', e.message));
+}, 1000);
+
 const server = http.createServer(async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET');
@@ -1328,6 +1549,37 @@ const server = http.createServer(async (req, res) => {
         ma5Param ? parseFloat(ma5Param) : undefined,
         tailParam ? parseFloat(tailParam) : undefined
       );
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(result || { skipped: true }));
+    } catch (err) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  // 일·주봉 마감 스크리너: 현재 유지 중인 목록 조회
+  if (reqUrl.pathname === '/screener/cycle/latest') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ...lastCycleMeta, items: activeCycleItems(), newCount: 0 }));
+    return;
+  }
+
+  // 일·주봉 마감 스크리너: 항목 닫기 (X 버튼)
+  if (reqUrl.pathname === '/screener/cycle/dismiss') {
+    const id = reqUrl.searchParams.get('id');
+    const existed = id ? cycleAlerts.delete(id) : false;
+    if (existed) broadcastCycle({ triggeredBy: 'dismiss' });
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: existed }));
+    return;
+  }
+
+  // 일·주봉 마감 스크리너: 테스트 실행 (저장/알람 없음, force=1이면 오늘 마감 여부와 상관없이 1~7일봉+주봉 전부 검사)
+  if (reqUrl.pathname === '/screener/cycle/run') {
+    try {
+      const force = reqUrl.searchParams.get('force') === '1';
+      const result = await runCycleScreenerJob({ triggeredBy: 'manual', force });
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify(result || { skipped: true }));
     } catch (err) {
