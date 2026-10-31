@@ -880,8 +880,9 @@ setInterval(() => {
 // ── 일·주봉 마감 스크리너 ──────────────────────────────────────────────
 // 매일 KST 08:59:50(= 바이낸스/업비트 일봉 마감 10초 전)에 실행.
 // "오늘 마감되는" 봉만 체크 - 마감 판정은 Pine 'Daily Cycle Close Finder' 규칙을 그대로 따름:
-//   - 일 사이클 N일봉: 매년 1/1 기준 barCount(0부터, 윤일 2/29는 3/1과 같은 값)가 N의 배수인 날 마감 (1일봉은 매일)
-//   - 주봉: 일요일(UTC) 일봉이 마감될 때 = 월요일 09:00(KST)에 주봉 마감
+//   - 일 사이클 N일봉: 매년 1/1 기준 barCount(0부터, 윤일 2/29는 3/1과 같은 값)가 N의 배수인 날의 09:00(KST)에 마감 (1일봉은 매일)
+//     예) 10/29는 barCount 301(=7×43) → 7일봉이 10/29 09:00(KST)에 마감 → 스캔은 10/29 08:59:50, 봉 구간은 10/22~10/28(UTC 일봉 7개)
+//   - 주봉: 월요일 09:00(KST)에 마감 (= 월요일 08:59:50에 스캔)
 // 대상: 바이낸스 24h 변동률 상위5+하위5, 업비트 상위5+하위5
 // 조건: 종가-MA5 이격 10% 이상, 꼬리/몸통 3.2% 이하, 방향(종가>MA5→양봉 / 종가<MA5→음봉)
 // 결과는 같은 봉의 다음 마감 시각까지 유지되고, 화면에서 X로 닫을 수 있음 (서버 메모리 보관 - 재시작하면 초기화)
@@ -894,14 +895,15 @@ function cycleBarCount(utcDate) {
   return DAYS_BEFORE_MONTH_NONLEAP[utcDate.getUTCMonth()] + utcDate.getUTCDate() - 1;
 }
 
-// utcDate 날짜의 일봉이 마감될 때 같이 마감되는 봉 목록 (예: ['1D','2D','6D','1W'])
-function closingCycleTfs(utcDate, force = false) {
+// openDate = 마감 시각(09:00 KST)에 새로 열리는 일봉의 UTC 날짜. 이 날짜의 카운트로 "지금 마감되는 봉" 목록을 구함 (예: ['1D','2D','6D','1W'])
+function closingCycleTfs(openDate, force = false) {
+  const utcDate = openDate;
   const out = [];
   const bar = cycleBarCount(utcDate);
   for (const n of CYCLE_DAY_PERIODS) {
     if (force || n === 1 || bar % n === 0) out.push({ key: `${n}D`, days: n, weekly: false });
   }
-  if (force || utcDate.getUTCDay() === 0) out.push({ key: '1W', days: 7, weekly: true });
+  if (force || utcDate.getUTCDay() === 1) out.push({ key: '1W', days: 7, weekly: true }); // 새 일봉이 월요일이면 주봉 마감
   return out;
 }
 
@@ -954,13 +956,15 @@ async function runCycleScreenerJob({ triggeredBy = 'manual', force = false } = {
   cycleRunning = true;
   const startedAt = Date.now();
   try {
-    // 일봉이 마감되는 "그 날짜"(UTC) = 실행 시각이 KST 08:59:50이면 UTC로는 아직 23:59:50인 오늘 날짜
+    // 실행 시각이 KST 08:59:50이면 UTC로는 아직 23:59:50 → todayUtc = 곧 마감되는 일봉의 날짜
+    // 마감 판정은 "마감 후 새로 열리는 일봉"의 날짜(= 내일 UTC)로 함 (10/29 09:00 마감 = 10/29 봉이 열리는 시각)
     const todayUtc = new Date(Math.floor(Date.now() / 86400000) * 86400000);
-    const closing = closingCycleTfs(todayUtc, force);
+    const openDate = new Date(todayUtc.getTime() + 86400000);
+    const closing = closingCycleTfs(openDate, force);
     const dayTfs = closing.filter((c) => !c.weekly);
     const weekTf = closing.find((c) => c.weekly);
     const todayOpenMs = todayUtc.getTime();
-    const weekOpenMs = todayOpenMs - 6 * 86400000; // 일요일 기준 이번 주 월요일 00:00 UTC
+    const weekOpenMs = todayOpenMs - 6 * 86400000; // 마감되는 주봉의 시작 = 6일 전 월요일 00:00 UTC (오늘 UTC는 일요일)
 
     const usdt = latestTickers.filter((t) => t.s.endsWith('USDT')).sort((a, b) => parseFloat(b.P) - parseFloat(a.P));
     const binTargets = [...usdt.slice(0, 5), ...usdt.slice(-5).reverse()];
