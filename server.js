@@ -289,6 +289,93 @@ async function fetchUpbitTop5() {
   return (await fetchUpbitRanked()).slice(0, 5);
 }
 
+// ── 기준봉과 "같이 마감하는" 10~95분봉 추가 조건 ──────────────────────────
+// 마감 시각(T)이 09:00(KST)부터 X분의 배수이면 X분봉도 그 시각에 같이 마감 (기준봉 자신은 제외).
+// 그런 X분봉 중 하나라도 MA5 이격 5% 이상 + 꼬리/몸통 8 이하 + 방향(종가>MA5→양봉, 종가<MA5→음봉)이면 통과.
+// 같이 마감하는 봉이 하나도 없는 시각이면 이 추가 조건은 건너뜀(기존 조건만으로 통과).
+const CO_MIN_TF = 10;
+const CO_MAX_TF = 95;
+const CO_MA5_PCT = 5;
+const CO_TAIL_MAX = 8;
+
+function coClosingTfs(tEndMs, baseTfMin) {
+  const kst = new Date(tEndMs + 9 * 3600 * 1000);
+  let m = ((kst.getUTCHours() * 60 + kst.getUTCMinutes()) - 9 * 60 + 1440) % 1440; // 09:00 기준 경과 분
+  if (m === 0) m = 1440;
+  const out = [];
+  for (let x = CO_MIN_TF; x <= CO_MAX_TF; x++) {
+    if (x !== baseTfMin && m % x === 0) out.push(x);
+  }
+  return out;
+}
+
+// 1분봉 [{t(시작 ms), o,h,l,c}] 오름차순에서, tEndMs에 끝나는 X분봉 5개를 시간 기준으로 묶어 판정
+function judgeCoCandle(candles1m, x, tEndMs) {
+  const span = x * 60000;
+  const buckets = [];
+  for (let b = 0; b < 5; b++) buckets.push([]);
+  for (const c of candles1m) {
+    if (c.t >= tEndMs) continue; // T 이후 캔들은 제외
+    const b = Math.floor((tEndMs - c.t - 1) / span);
+    if (b >= 0 && b < 5) buckets[b].push(c);
+  }
+  if (buckets.some((arr) => arr.length === 0)) return null; // 데이터 부족
+  const agg = buckets.map((arr) => ({
+    o: arr[0].o,
+    c: arr[arr.length - 1].c,
+    h: Math.max(...arr.map((v) => v.h)),
+    l: Math.min(...arr.map((v) => v.l)),
+  })); // agg[0] = 지금 마감하는 봉, agg[4] = 4개 전
+  const ma5 = agg.reduce((a, v) => a + v.c, 0) / 5;
+  const price = agg[0].c;
+  const devPct = ((price - ma5) / ma5) * 100;
+  const r = tailBodyRatio({ open: agg[0].o, high: agg[0].h, low: agg[0].l, close: agg[0].c });
+  const ma5Ok = Math.abs(devPct) >= CO_MA5_PCT;
+  const ratioOk = r.ratio !== null && r.ratio <= CO_TAIL_MAX;
+  const dirOk = r.isBullish !== null && ((price > ma5 && r.isBullish === true) || (price < ma5 && r.isBullish === false));
+  return { pass: ma5Ok && ratioOk && dirOk };
+}
+
+async function fetchBinance1mCandles(symbol, limit) {
+  const kl = await httpsGetJsonBinance(
+    `https://fapi.binance.com/fapi/v1/klines?symbol=${encodeURIComponent(symbol)}&interval=1m&limit=${Math.min(limit, 1500)}`,
+    10000
+  );
+  return kl.map((k) => ({ t: k[0], o: parseFloat(k[1]), h: parseFloat(k[2]), l: parseFloat(k[3]), c: parseFloat(k[4]) }));
+}
+
+async function fetchUpbit1mCandles(market, limit) {
+  let all = [];
+  let to = null;
+  while (all.length < limit) {
+    const url = `https://api.upbit.com/v1/candles/minutes/1?market=${encodeURIComponent(market)}&count=200` + (to ? `&to=${encodeURIComponent(to)}` : '');
+    const page = await httpsGetJson(url, 10000, { 'User-Agent': 'Mozilla/5.0' });
+    if (!page.length) break;
+    all = all.concat(page);
+    to = page[page.length - 1].candle_date_time_utc + 'Z'; // 이 시각보다 이전 캔들을 다음 페이지로
+    if (page.length < 200) break;
+    await sleep(150);
+  }
+  return all
+    .map((c) => ({ t: Date.parse(c.candle_date_time_utc + 'Z'), o: c.opening_price, h: c.high_price, l: c.low_price, c: c.trade_price }))
+    .sort((a, b) => a.t - b.t);
+}
+
+// 반환: { ok, tfs(통과한 X분봉 목록), checked(같이 마감하는 X분봉 목록) }
+async function coClosingCheck(exchange, symbol, baseTfMin, tEndMs) {
+  const xs = coClosingTfs(tEndMs, baseTfMin);
+  if (xs.length === 0) return { ok: true, tfs: [], checked: [] };
+  const maxX = Math.max(...xs);
+  const need = maxX * 5 + 10;
+  const candles = exchange === 'binance' ? await fetchBinance1mCandles(symbol, need) : await fetchUpbit1mCandles(symbol, need);
+  const tfs = [];
+  for (const x of xs) {
+    const j = judgeCoCandle(candles, x, tEndMs);
+    if (j && j.pass) tfs.push(x);
+  }
+  return { ok: tfs.length > 0, tfs, checked: xs };
+}
+
 // 상위 10개(바이낸스) + 상위5개(업비트)를, 그 시각에 지정된 분단위 시간봉 "딱 하나"로 확인해서
 // 현재가가 MA5 대비 ±10% 이상 이격되면 기록하는 스크리너
 async function runScreenerJob(forcedTfMin, triggeredBy = 'manual', customThreshold, displayTf) {
@@ -302,6 +389,7 @@ async function runScreenerJob(forcedTfMin, triggeredBy = 'manual', customThresho
   }
   screenerRunning = true;
   const startedAt = Date.now();
+  const tEndMs = Math.ceil(startedAt / 60000) * 60000; // 이번 스캔이 확인하는 마감 시각(다음 정각 분)
   try {
     const tfMin = forcedTfMin || 60; // 수동 호출인데 지정 안 하면 기본 60분으로 테스트 (계산에 쓰는 기준봉)
     const shownTf = displayTf ?? tfMin; // 화면에 표시할 봉 (없으면 기준봉과 동일)
@@ -344,7 +432,15 @@ async function runScreenerJob(forcedTfMin, triggeredBy = 'manual', customThresho
         // 방향 조건: 종가 < MA5 → 음봉만 통과, 종가 > MA5 → 양봉만 통과
         const directionOk = isBullish !== null && ((price > ma5 && isBullish === true) || (price < ma5 && isBullish === false));
         if (ma5Ok && ratioOk && directionOk) {
+          const co = await coClosingCheck('binance', t.s, tfMin, tEndMs);
+          if (!co.ok) {
+            console.log(`[screener] ${t.s} 기준봉 통과했지만 같이 마감하는 ${co.checked.join('/')}분봉 중 조건 충족 없음 → 제외`);
+            await sleep(300);
+            continue;
+          }
           results.push({
+            coTfs: co.tfs,
+            coChecked: co.checked,
             exchange: 'binance',
             symbol: t.s,
             tfMinutes: shownTf,
@@ -405,7 +501,15 @@ async function runScreenerJob(forcedTfMin, triggeredBy = 'manual', customThresho
         // 방향 조건: 종가 < MA5 → 음봉만 통과, 종가 > MA5 → 양봉만 통과
         const directionOk = isBullish !== null && ((price > ma5 && isBullish === true) || (price < ma5 && isBullish === false));
         if (ma5Ok && ratioOk && directionOk) {
+          const co = await coClosingCheck('upbit', u.market, tfMin, tEndMs);
+          if (!co.ok) {
+            console.log(`[screener] ${u.market} 기준봉 통과했지만 같이 마감하는 ${co.checked.join('/')}분봉 중 조건 충족 없음 → 제외`);
+            await sleep(250);
+            continue;
+          }
           results.push({
+            coTfs: co.tfs,
+            coChecked: co.checked,
             exchange: 'upbit',
             symbol: u.market,
             koreanName: u.koreanName,
@@ -439,6 +543,7 @@ async function runScreenerJob(forcedTfMin, triggeredBy = 'manual', customThresho
 
     const result = {
       time: Date.now(),
+      closeAt: tEndMs, // 이 스캔이 확인한 마감 시각 (화면의 "리스팅" 시각)
       scanned: [...top10.map((t) => t.s), ...upbitTop5.map((u) => u.market)],
       tfMinutes: shownTf,
             calcTfMinutes: tfMin,
@@ -460,7 +565,7 @@ async function runScreenerJob(forcedTfMin, triggeredBy = 'manual', customThresho
   return lastScreenerResult;
 }
 
-// 커스텀 스케줄 (242개) - 각 시각에 그 옆의 분단위 시간봉을 그 시각 "그대로" 체크함 (1분 전 아님)
+// 커스텀 스케줄 - 각 시각에 그 옆의 분단위 시간봉을 그 시각 "그대로" 체크함 (1분 전 아님)
 const CUSTOM_SCHEDULE = [
   { time: '09:20', tf: 20, threshold: 7 },
   { time: '09:30', tf: 15, threshold: 7 },
@@ -552,9 +657,7 @@ const CUSTOM_SCHEDULE = [
   { time: '17:00', tf: 480 },
   { time: '17:10', tf: 98, disp: 490 },
   { time: '17:20', tf: 100, disp: 500 },
-  { time: '17:24', tf: 84 },
   { time: '17:25', tf: 101, disp: 505 },
-  { time: '17:27', tf: 39 },
   { time: '17:30', tf: 102, disp: 510 },
   { time: '17:35', tf: 103, disp: 515 },
   { time: '17:40', tf: 104, disp: 520 },
@@ -575,17 +678,21 @@ const CUSTOM_SCHEDULE = [
   { time: '18:55', tf: 119, disp: 595 },
   { time: '19:00', tf: 120, disp: 600 },
   { time: '19:10', tf: 122, disp: 610 },
+  { time: '19:15', tf: 123, disp: 615 },
   { time: '19:20', tf: 124, disp: 620 },
-  { time: '19:21', tf: 69 },
   { time: '19:30', tf: 126, disp: 630 },
   { time: '19:35', tf: 127, disp: 635 },
   { time: '19:40', tf: 128, disp: 640 },
+  { time: '19:45', tf: 129, disp: 645 },
   { time: '19:50', tf: 130, disp: 650 },
+  { time: '19:55', tf: 131, disp: 655 },
   { time: '20:00', tf: 132, disp: 660 },
   { time: '20:10', tf: 134, disp: 670 },
   { time: '20:15', tf: 135, disp: 675 },
   { time: '20:20', tf: 136, disp: 680 },
+  { time: '20:25', tf: 137, disp: 685 },
   { time: '20:30', tf: 138, disp: 690 },
+  { time: '20:35', tf: 139, disp: 695 },
   { time: '20:40', tf: 140, disp: 700 },
   { time: '20:45', tf: 141, disp: 705 },
   { time: '20:50', tf: 142, disp: 710 },
@@ -600,6 +707,7 @@ const CUSTOM_SCHEDULE = [
   { time: '21:50', tf: 154, disp: 770 },
   { time: '21:55', tf: 155, disp: 775 },
   { time: '22:00', tf: 156, disp: 780 },
+  { time: '22:05', tf: 157, disp: 785 },
   { time: '22:10', tf: 158, disp: 790 },
   { time: '22:15', tf: 159, disp: 795 },
   { time: '22:20', tf: 160, disp: 800 },
@@ -620,9 +728,9 @@ const CUSTOM_SCHEDULE = [
   { time: '23:40', tf: 176, disp: 880 },
   { time: '23:45', tf: 177, disp: 885 },
   { time: '23:50', tf: 178, disp: 890 },
-  { time: '23:52', tf: 223 },
   { time: '23:55', tf: 179, disp: 895 },
   { time: '00:00', tf: 180, disp: 900 },
+  { time: '00:05', tf: 181, disp: 905 },
   { time: '00:10', tf: 182, disp: 910 },
   { time: '00:15', tf: 183, disp: 915 },
   { time: '00:20', tf: 184, disp: 920 },
@@ -632,16 +740,17 @@ const CUSTOM_SCHEDULE = [
   { time: '00:40', tf: 188, disp: 940 },
   { time: '00:45', tf: 189, disp: 945 },
   { time: '00:50', tf: 190, disp: 950 },
+  { time: '00:55', tf: 191, disp: 955 },
   { time: '01:00', tf: 192, disp: 960 },
   { time: '01:10', tf: 194, disp: 970 },
   { time: '01:15', tf: 195, disp: 975 },
   { time: '01:20', tf: 196, disp: 980 },
   { time: '01:25', tf: 197, disp: 985 },
-  { time: '01:29', tf: 43 },
   { time: '01:30', tf: 198, disp: 990 },
   { time: '01:40', tf: 200, disp: 1000 },
   { time: '01:45', tf: 201, disp: 1005 },
   { time: '01:50', tf: 202, disp: 1010 },
+  { time: '01:55', tf: 203, disp: 1015 },
   { time: '02:00', tf: 204, disp: 1020 },
   { time: '02:05', tf: 205, disp: 1025 },
   { time: '02:10', tf: 206, disp: 1030 },
@@ -655,6 +764,7 @@ const CUSTOM_SCHEDULE = [
   { time: '02:50', tf: 214, disp: 1070 },
   { time: '02:55', tf: 215, disp: 1075 },
   { time: '03:00', tf: 216, disp: 1080 },
+  { time: '03:05', tf: 217, disp: 1085 },
   { time: '03:10', tf: 218, disp: 1090 },
   { time: '03:15', tf: 219, disp: 1095 },
   { time: '03:20', tf: 220, disp: 1100 },
@@ -664,6 +774,7 @@ const CUSTOM_SCHEDULE = [
   { time: '03:50', tf: 226, disp: 1130 },
   { time: '03:55', tf: 227, disp: 1135 },
   { time: '04:00', tf: 228, disp: 1140 },
+  { time: '04:05', tf: 229, disp: 1145 },
   { time: '04:10', tf: 230, disp: 1150 },
   { time: '04:20', tf: 232, disp: 1160 },
   { time: '04:25', tf: 233, disp: 1165 },
@@ -691,12 +802,14 @@ const CUSTOM_SCHEDULE = [
   { time: '06:30', tf: 258, disp: 1290 },
   { time: '06:35', tf: 259, disp: 1295 },
   { time: '06:40', tf: 260, disp: 1300 },
+  { time: '06:45', tf: 261, disp: 1305 },
   { time: '06:50', tf: 262, disp: 1310 },
   { time: '07:00', tf: 264, disp: 1320 },
   { time: '07:05', tf: 265, disp: 1325 },
   { time: '07:10', tf: 266, disp: 1330 },
   { time: '07:15', tf: 267, disp: 1335 },
   { time: '07:20', tf: 268, disp: 1340 },
+  { time: '07:25', tf: 269, disp: 1345 },
   { time: '07:30', tf: 270, disp: 1350 },
   { time: '07:40', tf: 272, disp: 1360 },
   { time: '07:45', tf: 273, disp: 1365 },
