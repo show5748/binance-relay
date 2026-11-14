@@ -26,6 +26,7 @@ let pollCount = 0;
 let lastError = null;
 let lastSuccessAt = null;
 let latestTickers = []; // 최신 24hr 티커 스냅샷 (스크리너가 상위 10개 뽑는 데 씀)
+const UPBIT_IN_ALT_SCREENER = false; // 알트 스크리너에서 업비트 제외 (속도) - true면 다시 포함
 let upbitMarketsCache = null;
 let upbitMarketsCacheAt = 0;
 let symbolTypeCache = null; // { SYMBOL: { underlyingType, underlyingSubType } } - COIN이 아닌 것만 저장
@@ -285,8 +286,26 @@ async function fetchUpbitRanked() {
 }
 
 // 업비트 KRW 마켓 상위 5개(24h 변동률 기준) 조회 - 이격 스크리너용
+// 업비트 순위는 60초마다 미리 받아 두고, 스캔 때는 캐시를 바로 사용 (스캔 중 전체 시세 요청을 없애 지연 단축)
+let upbitRankedCache = null;
+let upbitRankedCacheAt = 0;
+async function refreshUpbitRanked() {
+  try {
+    upbitRankedCache = await fetchUpbitRanked();
+    upbitRankedCacheAt = Date.now();
+  } catch (err) {
+    console.log('[upbit] 순위 갱신 실패:', err.message);
+  }
+}
 async function fetchUpbitTop5() {
-  return (await fetchUpbitRanked()).slice(0, 5);
+  if (upbitRankedCache && Date.now() - upbitRankedCacheAt < 150000) return upbitRankedCache.slice(0, 5);
+  await refreshUpbitRanked();
+  if (!upbitRankedCache) throw new Error('upbit ranked unavailable');
+  return upbitRankedCache.slice(0, 5);
+}
+if (UPBIT_IN_ALT_SCREENER) {
+  refreshUpbitRanked();
+  setInterval(refreshUpbitRanked, 60000);
 }
 
 // ── 기준봉과 "같이 마감하는" 10~95분봉 추가 조건 ──────────────────────────
@@ -409,7 +428,7 @@ async function runScreenerJob(forcedTfMin, triggeredBy = 'manual', customThresho
 
     // 모든 종목을 동시에 확인 (순차로 하면 15초 안팎 걸려 알람이 늦어짐 → 병렬로 몇 초 안에 끝냄)
     let upbitTop5 = [];
-    const upbitTop5Promise = fetchUpbitTop5().catch((err) => {
+    const upbitTop5Promise = (!UPBIT_IN_ALT_SCREENER ? Promise.resolve([]) : fetchUpbitTop5()).catch((err) => {
       console.log('[screener] 업비트 상위5 조회 실패:', err.message);
       return [];
     });
@@ -524,13 +543,18 @@ async function runScreenerJob(forcedTfMin, triggeredBy = 'manual', customThresho
       }
     };
 
+    let binMs = 0, upRankMs = 0, upMs = 0;
     const [binResults, upbitResults] = await Promise.all([
-      Promise.all(top10.map(binanceTask)),
+      (async () => { const r = await Promise.all(top10.map(binanceTask)); binMs = Date.now() - startedAt; return r; })(),
       (async () => {
         upbitTop5 = await upbitTop5Promise;
-        return Promise.all(upbitTop5.map(upbitTask));
+        upRankMs = Date.now() - startedAt;
+        const r = await Promise.all(upbitTop5.map(upbitTask));
+        upMs = Date.now() - startedAt;
+        return r;
       })(),
     ]);
+    console.log(`[screener] 구간 소요: 바이낸스 ${binMs}ms / 업비트 순위 ${upRankMs}ms / 업비트 전체 ${upMs}ms`);
     const results = [...binResults, ...upbitResults].filter(Boolean);
 
     // 같은 코인이 양쪽에 다 걸리면 바이낸스 쪽을 우선하고 업비트 중복은 제거
