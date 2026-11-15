@@ -309,12 +309,13 @@ if (UPBIT_IN_ALT_SCREENER) {
 }
 
 // ── 기준봉과 "같이 마감하는" 10~95분봉 추가 조건 ──────────────────────────
-// 마감 시각(T)이 09:00(KST)부터 X분의 배수이면 X분봉도 그 시각에 같이 마감 (기준봉 자신은 제외). X = 10,15,20,...,95 (5분 단위만).
+// 마감 시각(T)이 09:00(KST)부터 X분의 배수이면 X분봉도 그 시각에 같이 마감 (기준봉 자신은 제외). X = 5,10,15,20,...,95 (5분 단위, 85 제외).
 // 그런 X분봉 중 하나라도 MA5 이격 5% 이상 + 꼬리/몸통 8 이하 + 방향(종가>MA5→양봉, 종가<MA5→음봉)이면 통과.
 // 같이 마감하는 봉이 하나도 없는 시각이면 이 추가 조건은 건너뜀(기존 조건만으로 통과).
-const CO_MIN_TF = 10;
+const CO_MIN_TF = 5;
 const CO_MAX_TF = 95;
 const CO_STEP_TF = 5; // 10, 15, 20, ..., 95
+const CO_EXCLUDE_TFS = [85]; // 같이 마감 판정에서 제외할 분봉
 const CO_MA5_PCT = 5;
 const CO_TAIL_MAX = 8;
 
@@ -324,7 +325,7 @@ function coClosingTfs(tEndMs, baseTfMin) {
   if (m === 0) m = 1440;
   const out = [];
   for (let x = CO_MIN_TF; x <= CO_MAX_TF; x += CO_STEP_TF) { // 10·15·20·…·95 (5분 단위만)
-    if (x !== baseTfMin && m % x === 0) out.push(x);
+    if (x !== baseTfMin && !CO_EXCLUDE_TFS.includes(x) && m % x === 0) out.push(x);
   }
   return out;
 }
