@@ -434,6 +434,7 @@ async function runScreenerJob(forcedTfMin, triggeredBy = 'manual', customThresho
       return [];
     });
 
+    const dbgRows = []; // 진단용: 종목별 계산값 (스캔 로그에 한 줄로 출력)
     const binanceTask = async (t) => {
       try {
         const kl = await httpsGetJsonBinance(
@@ -461,6 +462,7 @@ async function runScreenerJob(forcedTfMin, triggeredBy = 'manual', customThresho
 
         // 방향 조건: 종가 < MA5 → 음봉만 통과, 종가 > MA5 → 양봉만 통과
         const directionOk = isBullish !== null && ((price > ma5 && isBullish === true) || (price < ma5 && isBullish === false));
+        dbgRows.push({ s: t.s, dev: deviationPct, ratio, bull: isBullish, ok: ma5Ok && ratioOk && directionOk, ma5Ok, ratioOk, directionOk, lastClose: price });
         if (!(ma5Ok && ratioOk && directionOk)) return null;
 
         const co = await coClosingCheck('binance', t.s, tfMin, tEndMs);
@@ -556,6 +558,12 @@ async function runScreenerJob(forcedTfMin, triggeredBy = 'manual', customThresho
       })(),
     ]);
     console.log(`[screener] 구간 소요: 바이낸스 ${binMs}ms / 업비트 순위 ${upRankMs}ms / 업비트 전체 ${upMs}ms`);
+    {
+      const snapAgeSec = Math.round((Date.now() - (lastSuccessAt ? new Date(lastSuccessAt).getTime() : 0)) / 1000);
+      const dbg = dbgRows.map((r) => `${r.s.replace(/USDT$/, '')} 이격${r.dev.toFixed(1)}% 꼬리${r.ratio === null ? '-' : r.ratio.toFixed(1) + '%'} ${r.bull === null ? '?' : r.bull ? '양' : '음'} ${r.ok ? 'O' : 'X(' + (r.ma5Ok ? '' : '이격') + (r.ratioOk ? '' : '꼬리') + (r.directionOk ? '' : '방향') + ')'}`).join(' | ');
+      console.log(`[screener] 순위기준 ${snapAgeSec}초 전 · 대상 ${top10.map((t) => t.s.replace(/USDT$/, '')).join(',')}`);
+      console.log(`[screener] 계산값(마감 10초 전 기준): ${dbg}`);
+    }
     const results = [...binResults, ...upbitResults].filter(Boolean);
 
     // 같은 코인이 양쪽에 다 걸리면 바이낸스 쪽을 우선하고 업비트 중복은 제거
